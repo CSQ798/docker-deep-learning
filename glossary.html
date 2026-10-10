@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>术语总表 · 深海与木箱</title>
+<meta name="description" content="Docker 与计算机、AI 领域术语总表：英文缩写、英文全称、中文释义与详细解释。">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="glossary">
+
+<header class="topbar" id="topbar"></header>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="main">
+    <div class="wrap wide">
+      <article class="article" id="article">
+
+        <div class="ch-eyebrow"><span class="num">※</span><span>术语总表 · GLOSSARY</span></div>
+        <h1>术语总表：给每一个缩写一个家</h1>
+        <p class="ch-tagline">所有你看不懂的英文缩写，都该有一个能随时查的地方。</p>
+
+        <p class="ch-lead">
+          这份总表收录了手册里出现的全部术语，按主题分为 <span id="gl-catcount">11</span> 类。
+          每一条都包含四样东西：<strong>英文全称</strong>（它到底是怎么写的）、
+          <strong>英文缩写</strong>（你在文档里最常见的那个短写）、
+          <strong>中文释义</strong>（一句话能读懂的名字），以及
+          <strong>详细解释</strong>（它为什么存在、怎么工作、容易误解在哪里）。
+        </p>
+        <p>
+          你不必从头背下来。它的正确用法是：<em>读到不懂的词，回来查一次；查过三次以后，它自然就属于你了。</em>
+          如果你是在阅读章节时点开某个词跳到这里，当前词条会被自动定位到页面中间。
+        </p>
+
+        <div class="block method">
+          <span class="bt">术 语 的 正 确 学 法</span>
+          <ol>
+            <li><strong>先看缩写，再看全称。</strong>很多人对 <code>CLI</code>、<code>API</code>、<code>WSL</code> 这些缩写感到恐惧，其实它们只是几个英文单词的首字母。看到全称的那一刻，恐惧通常会立刻消失一半。</li>
+            <li><strong>用"它解决什么问题"来记，而不是用"它是什么意思"来背。</strong>术语是历史的沉积物，每一个都对应着某个具体的痛。想清楚那个痛，词义就自动挂上去了。</li>
+            <li><strong>把术语放进一个句子里说出来。</strong>例如："我用 <em>数据卷</em> 把数据库文件存在容器外面。"能说出这样一句话，说明这个术语已经变成了你的工具，而不是你的负担。</li>
+          </ol>
+        </div>
+
+        <div class="gl-bar">
+          <input class="gl-search" id="gl-search" type="search" placeholder="搜索术语 / 缩写 / 英文全称 / 解释中的任意词……" aria-label="搜索术语">
+          <div class="gl-chips" id="gl-chips">
+            <button class="chip on" data-cat="all">全部</button>
+            <button class="chip" data-cat="concept">容器与虚拟化</button>
+            <button class="chip" data-cat="docker">Docker 体系</button>
+            <button class="chip" data-cat="image">镜像与构建</button>
+            <button class="chip" data-cat="cmd">命令与运维</button>
+            <button class="chip" data-cat="storage">存储与数据</button>
+            <button class="chip" data-cat="network">网络</button>
+            <button class="chip" data-cat="compose">Compose 与编排</button>
+            <button class="chip" data-cat="linux">Linux 地基</button>
+            <button class="chip" data-cat="ai">AI / 机器学习</button>
+            <button class="chip" data-cat="security">安全与供应链</button>
+            <button class="chip" data-cat="eng">工程方法</button>
+          </div>
+          <div class="gl-count">当前显示 <b id="gl-total">0</b> 条</div>
+        </div>
+
+        <div id="glossary-body"></div>
+
+        <hr>
+        <p style="font-size:.9rem;color:var(--slate)">
+          找不到某个词？那说明这份手册有遗漏，值得被补上。你可以把它写在笔记本的"待解决问题"一页，
+          然后到 <a href="index.html">总览</a> 里找到对应章节，或者直接去官方文档里检索它。
+          <em>能自己找到术语定义，本身就是一项重要的能力。</em>
+        </p>
+      </article>
+
+      <footer class="footer">
+        <p><b>深海与木箱 · Docker 深度学习手册</b>　术语总表</p>
+        <p><a href="index.html">← 返回总览与地图</a></p>
+      </footer>
+    </div>
+  </main>
+</div>
+
+<script src="data/terms.data.js"></script>
+<script src="data/chapters.data.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

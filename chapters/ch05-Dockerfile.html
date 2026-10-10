@@ -1,0 +1,1060 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 05 章 · Dockerfile：把手工步骤写成不可辩驳的说明书 · 深海与木箱</title>
+<meta name="description" content="逐条讲透 Dockerfile 指令语义、CMD 与 ENTRYPOINT 的辨析、构建上下文与 .dockerignore、构建缓存与层顺序、多阶段构建与镜像瘦身、BuildKit 缓存挂载与密钥注入、基础镜像取舍。">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="ch05">
+
+<header class="topbar" id="topbar"></header>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="main">
+    <div class="wrap">
+      <article class="article" id="article">
+
+        <!-- ===================== 章首 ===================== -->
+        <div class="ch-eyebrow"><span class="num">第 05 章</span><span>构 建 的 艺 术 · BUILDING IMAGES</span></div>
+        <h1>Dockerfile：把手工步骤写成不可辩驳的说明书</h1>
+        <p class="ch-tagline">写得好的 Dockerfile 读起来像一篇结构清晰的短文。</p>
+
+        <div class="block goal">
+          <span class="bt">本 章 学 习 目 标</span>
+          <ul>
+            <li>能说清 Dockerfile 与"登录服务器手动装一遍"在本质上的差别，并指出后者为什么无法被审计与复现。</li>
+            <li>能解释每一条常用指令是否产生镜像层、为什么产生或不产生，以及这个差别带来的实际后果。</li>
+            <li>能彻底辨析 CMD 与 ENTRYPOINT，并预测"换一种写法、追加一个参数"之后容器到底会执行什么。</li>
+            <li>能说清构建上下文是什么、为什么它会被整包发送、以及 COPY 为什么无法取到上下文之外的文件。</li>
+            <li>能描述构建缓存的键由什么构成，并据此判断一份 Dockerfile 的层顺序会不会毁掉开发体验。</li>
+            <li>能解释多阶段构建为什么能把镜像缩小一个数量级，同时也说出它付出的代价。</li>
+            <li>能在 Debian、Alpine、slim、distroless、scratch 之间做出有理由的选择，而不是凭"哪个小选哪个"。</li>
+          </ul>
+        </div>
+
+        <div class="block skill">
+          <span class="bt">学 完 之 后 ， 你 应 该 能 够</span>
+          <ul>
+            <li>能独立为一个真实的 Node、Python 或 Go 项目写出可交付的 Dockerfile，并说明每一行的意图。</li>
+            <li>能用多阶段构建把一个几百 MB 甚至上 GB 的镜像压缩到几十 MB，并给出前后对比数据。</li>
+            <li>能通过调整指令顺序让日常开发中的构建从"每次两分钟"降到"每次三秒"。</li>
+            <li>能预判一条 docker run 命令会如何与镜像里的 CMD、ENTRYPOINT 相互作用。</li>
+            <li>能诊断"构建特别慢""镜像特别大""容器收不到停止信号"这三类典型症状的根因。</li>
+            <li>能为镜像加上合理的健康检查、标签与非 root 运行用户。</li>
+            <li>能在安全与权限受限的构建场景里，用 BuildKit 的机制注入密钥而不把它写进层。</li>
+            <li>能判断"继续优化镜像"是否已经越过了收益递减的边界。</li>
+          </ul>
+        </div>
+
+        <p class="ch-lead">第 04 章我们把容器的生命周期走得清清楚楚：怎么起、怎么停、怎么读日志、怎么从退出码里读出真相。可你有没有停下来想过一个问题——那些被 docker run 拉起来的容器，它们肚子里装的东西是从哪来的？整个第 04 章你都在运行别人做好的镜像，一条 docker run nginx 就得到一台"装好了的机器"。但如果你自己的课程设计要交给老师检查，而你只有一台 Windows 笔记本和一份 Python 源码，那份"装好了的状态"该怎么交出去？把源码压缩包发过去，再附一句"你要先 apt install 这些东西"？本章要给你的，是把那串手工步骤改写成一份<strong>可版本化、可评审、可复现的文本</strong>的能力。这份文本叫 Dockerfile，而它值得你反复打磨，因为它是你交付的全部诚意所在。</p>
+
+        <!-- ===================== 正文 ===================== -->
+        <h2 id="s1">从一份手工清单到一份不可辩驳的说明书</h2>
+        <p>先讲一个你可能已经经历过的场景。你配好了一台云服务器，装好了 Python、把依赖一个个 pip install 上去、改了几个配置、跑了服务，微信上给同学发了三条语音说"你要先装 gcc，然后注意那个 numpy 版本别装最新的"。三天后服务器磁盘满了，你重装系统，照着记忆再装一遍——这次卡在了一个报错上，你花了两个小时才想起来上次是因为某个库要指定版本。这不是你不够细心，这是"动作"这种信息载体的固有缺陷。</p>
+        <p>手工步骤有三个致命的性质。它不可评审：别人无法在事情发生之前看出哪里有问题，只能在你踩坑之后表示同情。它不可追溯：半年后没人记得这台机器上到底装过什么，包括你自己。<strong>它不可复现</strong>：同样的步骤在不同时间执行，结果可能不同——因为软件源里的包更新了、因为系统里预先装了别的东西、因为你当时手快跳过了一行。要解决这三件事，唯一的办法是把"动作"换成"声明"：不再描述我做了什么，而是描述我要求最终状态是什么样。</p>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 03 章我们剖开过镜像：它不是一个大文件，而是一叠只读层加一份配置，层之间靠内容哈希互相识别与复用，容器的可写层叠在最上面。第 03 章还留了一句话没展开——"每一个 Dockerfile 指令通常产生一层"。本章会把这句伏笔彻底兑现：层的存在方式决定了构建缓存怎么工作、镜像为什么瘦不下来、以及你写指令的顺序为什么比指令本身更重要。</p>
+        </div>
+
+        <h3 id="s1-1">Dockerfile 是一种声明，不是一份脚本</h3>
+        <p>Dockerfile 是镜像构建脚本的正式名字，但"脚本"这个词容易误导人。脚本是给机器顺序执行的一串动作，Dockerfile 更像一份<strong>声明式的构筑说明书</strong>：它声明这个镜像从哪个基础镜像生长出来、里面要有哪些文件、启动时默认执行什么。执行这份说明书的程序叫构建引擎，它有权对你的声明做各种优化——并行执行互不依赖的步骤、复用已有的层、跳过输入没变的部分。你把"怎么做"的一部分控制权交了出去，换来的是可复现和快。</p>
+        <p>这个交易属于一个更大的思想家族：基础设施即代码（Infrastructure as Code，IaC），用可版本化、可评审、可复现的文本描述环境，而不是靠人在界面上点击或手动敲命令。Dockerfile 是这个家族里最日常、门槛最低的成员——你不需要会 Terraform，也不需要懂集群，只要会写文本，就能得到 IaC 的核心收益。它最重要的收获不是"省事"，而是<strong>可复现与可审计</strong>：把 Dockerfile 提交进 Git，每一次改动都留下痕迹，任何人都能看出"这个镜像是怎么长出来的"。</p>
+        <p>具体到操作层面，一条构建命令长这样：</p>
+
+        <pre data-lang="bash"><code>docker build -t myapp:0.1 .</code></pre>
+        <p class="cmd-note">这条命令做三件事：把当前目录（结尾那个点）的内容打包发给构建引擎，构建引擎在它自己的世界里从零开始按 Dockerfile 执行，最后给结果贴上 myapp:0.1 这个标签。请把 -t 后面的名字当成"我给这个交付物起的名片"，把结尾的点当成"我要交出去的原材料范围"——这个点在本章第六节会变成主角。</p>
+
+        <p>这里要建立一个贯穿全章的直觉：<strong>构建发生在引擎自己的世界里，与你笔记本当前的状态无关</strong>。你在本机装过的 Python 3.9、你 PATH 里那个奇怪的编译器、你 AppData 里的缓存，构建过程一概看不见。这不是洁癖，这是它的全部价值——正因为它看不见你的机器，所以它能被别人复现。</p>
+
+        <details>
+          <summary>展开：docker build 与 docker buildx build 是什么关系</summary>
+          <p>你现在敲 docker build，实际调用的是构建引擎 BuildKit 的前端，而 docker buildx build 是同一个前端的显式写法，并额外提供了多平台构建、缓存导入导出、把构建结果输出到本地目录等能力。Docker Desktop 默认开启 BuildKit，所以两者在你机器上跑的是同一套引擎。这份手册提到"构建引擎"时指的就是 BuildKit 这一层；提到"旧构建器"时，指的是 2018 年之前那套一次只走一步、不能并行、进度以 Step 1/8 形式打印的实现。这个分界之所以值得知道，是因为网上大量老教程里"构建顺序不能改"之类的说法，有些已经在新引擎下被改写了条件。</p>
+        </details>
+
+        <div class="block metaphor">
+          <span class="bt">比 喻</span>
+          <p>Dockerfile 像一份菜谱，而不是一段"我当初是怎么把这道菜做出来的"的录像。录像只能记录一次烹饪的全过程，抄不出第二盘味道完全一样的菜；菜谱写的是"用多少克、加热到几度、几分钟"，任何人都能照着复现，还能被另一位厨师批评"这里火候写得不清楚"。构建引擎就是那位照着菜谱干活、并且把切菜和烧水同时进行的厨房助手。</p>
+          <p>但要小心比喻的边界：菜谱的每一行都会被完整执行，而 Dockerfile 的"行"会被缓存成层——重复做第二盘菜时，助手会告诉你"备料这一步骤和上次一模一样，料已经切好了，我跳过"。这个"跳过"就是本章第七节的全部难点。</p>
+        </div>
+
+        <h3 id="s1-2">不可辩驳的含义</h3>
+        <p>"不可辩驳"这个词听起来有点重，它指的是三件具体的事。</p>
+        <p><strong>第一，事实胜于记忆。</strong>当同学问你"这个项目要装什么依赖"，你不需要回忆，把 Dockerfile 发过去就是完整答案。它比 README 更可靠，因为 README 可能过时，而 Dockerfile 一旦过时会立刻构建失败——它自带校验机制。</p>
+        <p><strong>第二，环境不再是变量。</strong>第 01 章反复讲的那个"在我机器上能跑"的痛，本质上是环境差异不可控。构建引擎的世界里只有基础镜像和你声明的步骤，所以"我这台机器上装了某个东西"这个变量被彻底消除了。你把不确定性从运行时挤到了构建时，而构建时的不确定性可以被锁定版本、可以被审查。</p>
+        <p><strong>第三，交付物是唯一的。</strong>传统交付是"源码 + 一份含糊的环境说明"，镜像交付是"源码 + 精确的环境 + 精确的启动方式"。老师和同学拿到的不是"可能跑起来的代码"，而是一个已经构建完成的、确定会跑起来的东西。</p>
+
+        <blockquote><p>手工步骤解释"我曾经做过什么"，Dockerfile 承诺"任何人任何时候都能得到同样的东西"。前者靠信任，后者靠机制。</p></blockquote>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>如果 Dockerfile 已经让环境完全可复现，那为什么还可能出现"我构建出来的镜像在同学电脑上跑不起来"？请尽量举出至少两种完全不同的原因，并说出它们分别属于哪一层的问题。
+              <span class="sub">提示：想一想两个世界里可能不同的东西——构建的那一侧，和运行的那一侧。</span>
+            </li>
+            <li>你的 Dockerfile 里写了一句 RUN apt-get install -y curl。三年后这个 Dockerfile 还能构建出完全一样的镜像吗？如果不能，那"可复现"这个承诺的边界在哪里，你打算怎么补上？
+              <span class="sub">提示：想想 apt 源里那个叫 curl 的包，三年后的内容由谁决定。</span>
+            </li>
+          </ol>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 10 章会把这份"不可辩驳的说明书"接进流水线：每次你往 Git 推一次代码，机器自动执行 docker build、自动打上版本标签、自动推到镜像仓库、自动部署。到那时你会发现，Dockerfile 里每一个不确定性（比如没锁版本、比如依赖外部网络下载）都会在流水线上被放大成"昨天还能构建、今天就红了"的事故。现在先埋一个伏笔：请在写每一行时问自己，"这行依赖网络吗？依赖时间吗？"</p>
+        </div>
+
+        <h2 id="s2">一份 Dockerfile 的逻辑骨架</h2>
+        <p>Dockerfile 的指令有二十多条，但真实项目里的骨架只有四段。把这四段记住，之后所有优化、所有疑难，你都可以回到它上面来定位。</p>
+        <p>第一段：定地基。用 FROM 声明基础镜像：我站在什么操作系统、什么运行时之上。这一段决定了镜像的体积下限、可用的包管理器、以及未来所有的兼容性问题。第二段：装依赖。用 RUN 执行安装命令，或把依赖清单复制进去之后安装。这一段决定了功能的完备性。第三段：拷代码。用 COPY 把你自己的源码和资源放进去。这一段是你的产品本身。<strong>第四段：定启动。</strong>用 WORKDIR、ENV、USER、EXPOSE、CMD、ENTRYPOINT 描述"这个镜像被运行时，应该以什么身份、在什么目录、执行什么程序"。这一段决定了这个镜像的行为接口。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>骨架阶段</th><th>常用指令</th><th>变化的频率</th><th>体积量级</th><th>顺序放错的代价</th></tr></thead>
+            <tbody>
+              <tr><td>一、定地基</td><td>FROM</td><td>几个月一次（换版本时）</td><td>几 MB 到 1 GB</td><td>改一次全镜像重建，但本身就该慎改</td></tr>
+              <tr><td>二、装依赖</td><td>RUN、COPY 依赖清单</td><td>几周一次</td><td>几十 MB 到 800 MB</td><td>放到源码之后，改一行代码就重装依赖</td></tr>
+              <tr><td>三、拷代码</td><td>COPY、ADD</td><td>每次提交都变</td><td>几 KB 到几 MB</td><td>放到依赖之前，缓存全废，构建时间翻十倍</td></tr>
+              <tr><td>四、定启动</td><td>WORKDIR、ENV、USER、EXPOSE、HEALTHCHECK、CMD、ENTRYPOINT</td><td>很少变</td><td>几乎为零（只改配置）</td><td>放在前面会让后面所有层失效</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>看这张表最右边一列。你会发现四段的顺序不是美学习惯，而是<strong>变化频率的降序排列</strong>：越少变的东西越往前放，越多变的东西越往后放。第七节讲缓存时你会看到，这条规则的唯一目的就是让"改一行代码"这件事只重建一层。</p>
+
+        <h3 id="s2-1">用骨架读别人写的 Dockerfile</h3>
+        <p>现在给你一个练习：以后在 GitHub 上看到任何 Dockerfile，先不要逐行读，先做一件事——判断它属于哪一段。看到 FROM，你知道地基在哪；看到 apt-get install 或 npm ci，你知道依赖段在哪；看到 COPY . .，你知道"从这里开始每一行都注定每次重建"；看到 CMD，你知道这是接口。这个划分会让你在三秒内判断出一份 Dockerfile 的水平：<strong>如果 COPY . . 出现在依赖安装之前，作者大概没被构建慢折磨过</strong>。</p>
+        <p>更重要的用途是排障。镜像太大？去地基段和依赖段找——是不是基础镜像选得太重，是不是依赖里带进了编译工具链和缓存文件。构建太慢？去依赖段和拷贝段之间找——是不是顺序反了，是不是每次都在重新下载整棵依赖树。容器启动行为不对？去看第四段——CMD 和 ENTRYPOINT 写成了什么形式。<strong>三段式定位法能让你在没有任何背景知识的情况下，把绝大多数 Dockerfile 问题归到一个具体的区域里。</strong></p>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>学一门"配置语言"的通用方法是：不要背指令表，而是先建立"它有几个正交的维度"。Dockerfile 的每一条指令都可以用四个问题来测量——<strong>它产生新层吗？它写在构建期还是运行期生效？它的输入包含文件内容吗？它失败时是硬报错还是被忽略？</strong>把任意一条指令放进这四个问题里过一遍，你得到的理解比背十遍语法表都牢固。这个方法离开 Docker 也管用：学 nginx 配置时问"这条指令在哪个上下文生效、作用范围多大"，学 Git 时问"这个操作动的是工作区、暂存区还是历史"，都是同一套问法。</p>
+        </div>
+
+        <p>下面这份 Dockerfile 你不需要现在完全读懂，它只是让你先看到骨架长什么样。它是一个最小的 Python 服务，我们会在本章里反复改造它。</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+ENV APP_PORT=8000
+EXPOSE 8000
+CMD ["python", "app.py"]
+EOF</code></pre>
+        <p class="cmd-note">这是一段在 Linux 或 WSL 终端里执行的命令，它把两个 EOF 之间的内容原样写进当前目录的 Dockerfile。注意 COPY requirements.txt . 这一行下面那个点代表"当前工作目录"，也就是上一行 WORKDIR 设定的 /app——这和你在终端里敲命令时点的含义不一样，它是 Dockerfile 自己的语法。也请注意 requirements.txt 在源码之前被复制：这是骨架顺序的具体体现，第五节会解释为什么它值这么多。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>初学者最常见的写法是把依赖清单和源码一起拷进去：COPY . . 之后紧接着 RUN pip install -r requirements.txt。这在功能上完全正确，构建也成功，所以你感觉不到任何问题——直到你改了 app.py 里的一个错别字，重新构建，发现它花了三分钟把整棵依赖树又装了一遍。<strong>这个错误的可怕之处在于它不报错，只让你每天多等几十次三分钟。</strong>自查方法很简单：改一行源码重新构建，看输出里有多少行显示 CACHED；如果依赖那一步没有显示 CACHED，你的顺序就写反了。</p>
+        </div>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 04 章讲退出码时提到，容器主进程退出后容器就结束，而 docker stop 会先发信号再等待。当时我们只讲了运行时的行为，没有回头看镜像这一侧。现在可以补一句：容器主进程到底是谁、它能不能收到信号，其实是 Dockerfile 里的写法决定的。第三节末尾和第五节会把这件事讲到底——你写下的 CMD 或 ENTRYPOINT 用什么形式，直接决定了第 04 章那套优雅停机能不能成立。</p>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 06 章会专门讲数据和卷。这里先埋一个雷：第四节讲到 VOLUME 指令时，你会发现它会在镜像里留下一个"声明"，让每次运行都自动创建一个匿名卷，而删除容器时它并不跟着走。很多人在 Dockerfile 里随手写一行 VOLUME 只为"看起来专业"，结果在笔记本上悄悄堆了几十 GB 的看不见的数据。等你读完第 06 章，再回头看那一行，感觉会完全不同。</p>
+        </div>
+        <h2 id="s3">指令逐个讲透：语义、是否产生层、以及别人是怎么写错的</h2>
+        <p>这一节是本章的主体。我给你的不是指令速查表，而是<strong>每一条指令的四个侧面</strong>：它的语义是什么、它产生层吗、初学者最容易在哪摔倒、以及它值得在什么场合出现。读完这一节你应该达到一个状态：看到任何一条指令，脑子里自动浮现"它会不会让镜像变大、它会不会让缓存失效"。</p>
+        <p>先给一个总纲，它是理解后面所有细节的钥匙：<strong>Dockerfile 的指令分成两类，一类改变文件系统（于是必须产生一层），另一类只修改镜像的配置元数据（于是不产生层，只改一份 JSON）</strong>。RUN、COPY、ADD 属于前者；FROM 特殊，它把另一个镜像的层直接接过来当作起点；其余大多数指令属于后者。这个分类会解释一个你想不通的现象：为什么删掉十个文件的那条 RUN 只让镜像变大了几 KB，而后面一条 ENV 明明什么都没装却"也是一行"。</p>
+
+        <h3 id="s3-1">FROM：一切的地基</h3>
+        <p>FROM 声明基础镜像，它必须是 Dockerfile 里第一条有效指令（ARG 可以例外放在它前面）。它的完整写法有两种形态：FROM 镜像名:标签 用于直接引用，FROM 镜像名 AS 阶段名 用于给这个构建阶段起名，后者是多阶段构建的基础，我们第八节再展开。</p>
+        <p>关于 FROM 有两件事必须现在说清。第一，标签一定要写。不写标签等于写了 latest，而 latest 是一个可以被上游随时移动的指针——今天你构建出的镜像基于某个版本，明天同样的 Dockerfile 可能基于另一个版本。你在第一节思考题里问过的"三年后还能构建出一样的镜像吗"，最直接的补救措施就是从 FROM 开始锁版本。<strong>第二，FROM 本身不产生新层，但它决定了你不拥有也删不掉的那些层。</strong>你选了一个 1.1 GB 的 node:20，你的镜像就至少有 1.1 GB 的底子，后面所有瘦身努力都在这个底子上做减法，减不到零。</p>
+        <p>还有一个特殊值：FROM scratch。scratch 是镜像是空的代名词，<strong>表示"什么都不基于"</strong>。它不是一个能 pull 下来的镜像，而是构建引擎认识的一个关键字。写 FROM scratch 意味着你的镜像里只有你自己 COPY 进去的东西，没有 shell、没有包管理器、没有证书文件、没有时区数据。这条路只对静态编译的程序可行（Go、Rust 在合适配置下能做到），而且你会立刻怀念那些"本来就在那儿"的东西——比如 HTTPS 请求需要的根证书。第三节末尾的基础镜像决策部分会把这五种起点摆在一起比较。</p>
+
+        <h3 id="s3-2">RUN：最常用，也最容易写错</h3>
+        <p>RUN 在构建期执行一条命令，并把命令造成的文件系统变化固化成一层。这是它唯一需要你记住的性质：<strong>RUN 的产物不是"命令的输出"，而是"命令对文件系统做了什么"</strong>。RUN echo hello 什么文件都没动，所以它产生的是一个几乎空的层；RUN apt-get install -y curl 动了成千上万个文件，所以它产生一个很厚的层。</p>
+        <p>因为每条 RUN 都是一层，所以有两种写法：一条命令一层，或者把多条命令用 &amp;&amp; 串成一条 RUN。后者是推荐做法，原因是层是不可变的——你在第一层下载了 50 MB 的安装包，在第二层把它们删掉，第一层的 50 MB 依然躺在镜像里，因为"删除"只是一条记录在第二层的白障标记。第 03 章讲联合文件系统时提过这个机制，现在它变成了你手上的具体纪律：</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM debian:12-slim
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends curl ca-certificates \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+EOF</code></pre>
+        <p class="cmd-note">这是本手册里唯一一处用到反斜杠续行的代码块，因为它是写在文件内部的内容，由 shell 解析，Windows 用户把它写进 Dockerfile 时不会有任何问题。三条命令被串成一层：更新索引、安装、删除索引。你会在构建输出里看到三层动作，但在镜像里只有一个层。--no-install-recommends 告诉 apt 不要顺手装那些"推荐但非必需"的包，在 Debian 上这常常能省下几十 MB。</p>
+
+        <p>现在回答那个经典问题：为什么 apt-get update 必须和 apt-get install 写在一个 RUN 里？因为 apt 的安装索引存放在 /var/lib/apt/lists/ 这个目录里，而<strong>构建缓存记的是"这条指令的输入有没有变"，不是"这条指令的输出是不是过时了"</strong>。如果你写成两条 RUN，第一条 RUN apt-get update 会因为指令文本没变、父层没变而命中缓存，于是构建引擎直接复用它几个月前留下的那批索引；第二条 RUN apt-get install 拿着这批陈旧的索引去下载包，运气不好就是 404。这不是理论推测，这是每个用 Ubuntu 基础镜像的人都遇到过的事故。把两条写在一起，索引和安装就变成同一个不可分割的缓存单位：要么都是新的，要么一起重建。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>与上面那条同样常见的错误是"构建时下载大文件"。比如 RUN curl -O https://某处/big-model.bin 或者 RUN apt-get install 一整套编译工具链只为了编一个依赖。这些动作会让构建严重依赖外部网络与外部服务的可用性，也让缓存变得极不稳定——今天能构建，明天网址变了就红。<strong>判断准则：构建过程应当尽量自包含。</strong>需要在构建期获取外部资源时，至少要锁定 URL 与校验值，并在心里给它记一笔"这是我的构建流程里最脆弱的一环"，第 10 章会告诉你这一环在流水线上会如何发作。</p>
+        </div>
+
+        <h3 id="s3-3">COPY 与 ADD：功能更多的那一个反而不该用</h3>
+        <p>COPY 把文件从构建上下文复制进镜像，ADD 也能做这件事，而且额外多两个本事：如果源文件是本地 tar 归档（.tar、.tar.gz、.tgz 等常见压缩格式），ADD 会<strong>自动解压</strong>；如果源是一个 URL，ADD 会去下载。听上去 ADD 是 COPY 的超集，为什么官方构建最佳实践反而建议优先用 COPY？</p>
+        <p>因为它多出来的两件事都在制造意外。自动解压是隐式的：读 Dockerfile 的人看到 ADD app.tar.gz /app，很难立刻意识到 /app 里出现的不是一个压缩包而是一棵解压后的目录树；这种"看不出来"的副作用在需要别人接手时是负担。从 URL 下载看似方便，实际上它把不可控的网络行为写进了构建，而且下载下来的文件权限是 600，通常还得再补一条 RUN chmod 才能用——绕了一圈不如用 curl。<strong>推荐纪律：除非你明确需要自动解压，否则一律用 COPY。</strong>让每一行做的事显式、单一、可预测，这是 Dockerfile 可读性的核心。</p>
+        <p>COPY 的语法细节值得单独记三条。第一，目标路径以斜杠结尾表示"这是一个目录"，例如 COPY app.py /app/ 会得到 /app/app.py；不以斜杠结尾时行为取决于目标是否已存在，容易出意外，<strong>建议养成写斜杠的习惯</strong>。第二，源路径不能走出上下文，COPY ../secret.txt / 一定会失败，原因在第六节。第三，COPY 支持一次复制多个源，也支持 --chown 和 --chmod 参数来直接指定所有者与权限，避免再加一条 RUN chmod 浪费一层。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>对比项</th><th>COPY</th><th>ADD</th></tr></thead>
+            <tbody>
+              <tr><td>基本职责</td><td>从上下文复制文件到镜像</td><td>同样，且功能更多</td></tr>
+              <tr><td>自动解压 tar</td><td>不支持</td><td>支持本地 tar 归档自动解压</td></tr>
+              <tr><td>从 URL 下载</td><td>不支持</td><td>支持，但权限为 600，且不受 .dockerignore 影响</td></tr>
+              <tr><td>产生的层</td><td>一层</td><td>一层</td></tr>
+              <tr><td>可预测性</td><td>高：看得见什么就放进什么</td><td>低：解压与下载都是隐含副作用</td></tr>
+              <tr><td>官方建议</td><td>默认选择</td><td>仅在确实需要上述两个特性时使用</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="s3-4">WORKDIR：为什么不写 RUN cd</h3>
+        <p>WORKDIR 设置后续指令的工作目录，并会在镜像里持久生效——包括容器启动时的工作目录。RUN cd /app 则是一个幻觉：它在那一层的 shell 里改变目录，shell 执行完毕退出，这一层的文件系统记录变成一个空的"我进过 /app"，下一条 RUN 又从原来的目录开始。<strong>每一条 RUN 都是一个独立的 shell 会话，会话之间不共享任何东西。</strong>这条性质解释了很多第一次写 Dockerfile 时的困惑：为什么我 RUN export 的变量下一条指令看不见？为什么我 RUN 里 cd 过去的东西下一条又找不到了？</p>
+        <p>WORKDIR 有一个容易被忽略的优点：目录不存在时它自动创建。所以 WORKDIR /app 不必搭一条 RUN mkdir -p /app，而且它不产生层。另外它会递归继承，WORKDIR /app 之后写 WORKDIR src，最终目录是 /app/src，用的是相对路径语义。</p>
+
+        <h3 id="s3-5">ENV 与 ARG：构建期的秘密与运行期的配置</h3>
+        <p>这两个都是"变量"，但活在完全不同的时间里。ENV 设置的是镜像的环境变量，它会写进镜像配置，被运行时的容器继承，也会被后续所有 Dockerfile 指令看到。ARG 是构建期参数，由 docker build --build-arg 传入，只在构建过程中存在，<strong>不会</strong>进入容器的运行环境——除非你显式地把 ARG 的值赋给 ENV。</p>
+        <p>用途上有一个干净的分界线。ENV 用来放"这个镜像运行时的配置"：应用监听的端口、默认日志级别、时区、语言环境。这类东西的共同特征是"运行时需要读、且不同部署环境可能不同"，它们也正是十二要素应用里"配置存于环境"那条原则的载体。<strong>ARG 用来放"这次构建需要知道的信息"</strong>：要构建哪个 Git 提交号、要装哪个版本号、要连哪个内部源。这类信息的共同特征是"只在造它的时候有用，跑起来之后完全不需要"。把它留在运行环境里是污染，甚至是风险。</p>
+        <p>说到风险，就必须讲 ARG 那个著名的坑。<strong>ARG 的值会留在镜像的构建历史里，任何人都能用 docker history 看到。</strong>因为构建引擎在记录这一层时，把"这条指令的完整文本（含变量取值）"写进了元数据——即使这一层实际上什么都没做。我请你亲手验证一次，因为这个坑太常见，看别人说一百遍不如自己看一次输出：</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.20
+ARG DB_PASSWORD=this-is-a-fake-secret
+RUN echo "building with a secret"
+EOF
+docker build -t argleak:1 .
+docker history --no-trunc argleak:1</code></pre>
+        <p class="cmd-note">你会看到历史列表里有一行赫然写着 ARG DB_PASSWORD=this-is-a-fake-secret，而且因为加了 --no-trunc，它不会被省略号截断。请特别注意：这不是 echo 打出来的，而是构建引擎记录这一层时把指令文本一起存了下来。反过来说，RUN echo "密码是 $DB_PASSWORD" 这种写法更糟——值会被文件系统层面的层直接固化，也会留在构建日志里。</p>
+
+        <p>那私有依赖怎么办？你构建时需要从私有 npm 源或私有 apt 源拉包，总得带凭据吧。这正是第八节要讲的 BuildKit 密钥注入要解决的问题：它能让凭据在构建那一瞬间可用、构建完就消失、<strong>并且不进任何一层</strong>。在你学会它之前，请把"ARG 传密钥"当成需要立刻改掉的习惯。</p>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>有一个零成本的自查习惯值得从今天开始：任何一次你打算把某个值写进 Dockerfile，先问一句"它进了层还是进了配置"。有个很实用的判定技巧——<strong>用 docker history 看镜像的每一层，用 docker run --rm 镜像 env 看运行时的环境变量</strong>。前者告诉你"造的时候用了什么"，后者告诉你"跑的时候有什么"。两个命令一起用，几乎可以定位所有"这个值到底藏在哪儿"的问题。网络资料里那些关于 ENV、ARG、密钥、缓存的争论，你在自己机器上花两分钟就能验证，不必信谁。</p>
+        </div>
+
+        <h3 id="s3-6">EXPOSE：一条什么都不做的指令，为什么应该留下</h3>
+        <p>先把最常见的误解拍死：<strong>EXPOSE 不发布任何端口。</strong>写了 EXPOSE 8000，你的浏览器依然打不开，因为容器的网络命名空间与宿主机是隔开的，要打通必须靠 docker run -p 8000:8000 或 compose 里的 ports 字段——端口映射那件事我们在第 07 章会从网络命名空间和转发规则讲到底。这条误解代价很大：很多人构建完镜像，run 起来发现访问不了，反复检查 Dockerfile 里的 EXPOSE，越检查越困惑。</p>
+        <p>那 EXPOSE 存在的意义是什么？三层。第一层是文档：它是镜像作者写给使用者的一句话"我这个程序在容器里监听这个端口"，读 Dockerfile 的人不必去翻源码或日志就知道该映射哪个端口。第二层是工具链的约定：docker run -P（大写 P）会把镜像里所有 EXPOSE 过的端口随机映射到宿主机的高位端口，Compose 和一些编排工具也会读这个字段做默认处理。<strong>第三层是接口思维</strong>：它把"这个服务的对外接口是什么"写进了交付物本身，而不是留在作者脑子里。</p>
+        <p>顺带把 EXPOSE 的语法歧义讲清楚。EXPOSE 8000/tcp 是显式的，EXPOSE 8000 默认就是 tcp。写 EXPOSE 8000/udp 才表示 UDP。它只是声明，不是开关，写错了也不会报错，只会在你需要 -P 时给你一个意外的映射结果。</p>
+
+        <h3 id="s3-7">VOLUME、USER、HEALTHCHECK、LABEL 与其他</h3>
+        <p>VOLUME 在镜像里声明一个挂载点。它的作用是"挂载点声明"，让运行这个镜像的人（以及 Compose、编排系统）知道"这个目录里的数据应该外置"。它有一个副作用需要现在就知道：<strong>声明过的目录，在被 docker run 时如果没有显式挂载别的卷，Docker 会自动为它创建一个匿名卷</strong>。匿名卷没有名字，删除容器时也不会跟着删除，于是它变成一个你几乎看不见的磁盘占用者。更隐蔽的是，这一步的自动创建是发生在那次运行时的，与你的 Dockerfile 无关，所以你在构建时根本意识不到。</p>
+        <p>在 Dockerfile 里写 VOLUME 通常是"为下游使用者提供正确默认值"的做法（比如官方 postgres 镜像就是这么做的，保证你不小心时数据也不会写进容器的可写层）。但它不该被当成"我怎么挂卷"的手段——挂载的决定权在 docker run 和 compose.yaml 手里。第 06 章会把这条线彻底拉直。</p>
+        <p>USER 切换后续指令与容器运行时使用的用户。它的价值在安全：容器默认以 root 运行，一旦应用被攻破，攻击者拿到的是容器内的 root，而容器的 root 在某些配置下离宿主机比你想的近。写 USER appuser 之前需要先创建这个用户并处理好文件所有权，这里面有一串容易踩的细节。这是一个值得认真对待的话题，第 09 章会从威胁模型讲起。</p>
+        <p>HEALTHCHECK 告诉 Docker 怎么判断这个容器"还健康"。它有三种状态：starting（刚开始检查，还没定论）、healthy（检查通过）、unhealthy（连续失败达到阈值）。<strong>最需要记住的一点是：unhealthy 不会自动重启容器。</strong>它只把事实记录在容器状态里，让 docker ps 显示出来，让 Compose 的依赖判断可以用上，让编排系统去做决策。很多人以为加了健康检查就有了自愈能力，实际上那只是"体检报告"，不是"急救措施"——真正的自愈要么靠 docker run --restart 配合应用自己退出，要么靠 Compose 的条件依赖，要么靠第 12 章的编排系统。</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+ENV PYTHONUNBUFFERED=1
+LABEL org.opencontainers.image.title="tinyweb" \
+      org.opencontainers.image.description="a tiny demo service for the manual"
+EXPOSE 8000
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+CMD ["python", "app.py"]
+EOF
+docker build -t tinyweb:health .
+docker run -d --name tw -p 8000:8000 tinyweb:health
+docker ps
+docker inspect -f "{{.State.Health.Status}}" tw</code></pre>
+        <p class="cmd-note">最后一条命令会打印出容器的健康状态字符串：starting、healthy 或 unhealthy。注意检查命令写在容器内部，所以它请求的是 127.0.0.1:8000，这个地址在容器自己的网络命名空间里指向它自己——不是你的 Windows 浏览器里的那个 127.0.0.1。这个差别初学时非常容易搞混，第 07 章讲网络命名空间时会讲透。PYTHONUNBUFFERED=1 是一个经验之谈：不设它时 Python 的标准输出会被缓冲，docker logs 里看到的日志会延迟一大段才出现，排障时非常误导人。</p>
+
+        <p>LABEL 是给镜像贴元数据的键值对，不影响运行，不影响层，纯粹是信息。它的价值要从"镜像进入流水线之后"才显现：镜像的作者是谁、构建于哪个 Git 提交、遵循哪个许可证、源码在哪。这些信息在几百个镜像的仓库里是救命的。开放容器倡议（Open Container Initiative，OCI）定义了一组标准标签名，都以 org.opencontainers.image. 开头，比如 title、description、source、revision、licenses。<strong>用标准键名而不是自己拍脑袋起名，是最低成本的可互操作性投资。</strong></p>
+
+        <details>
+          <summary>展开：SHELL、STOPSIGNAL 与 ONBUILD——三条你很少用但值得知道的指令</summary>
+          <p>SHELL 改写后续 RUN、CMD、ENTRYPOINT 的 shell 形式所用的解释器。它存在的主要理由是 Windows 容器：Windows 环境下默认的 shell 是 cmd，写 RUN 时会有一堆转义问题，改用 PowerShell 需要显式声明。在 Linux 容器里你几乎用不着它，但知道它的存在能让你理解"shell 形式为什么要包一层 /bin/sh -c"这件事是可以被改写的。</p>
+          <p>STOPSIGNAL 指定 docker stop 给容器主进程发哪个信号，默认是 SIGTERM。它什么时候有用？当你的程序不是监听 SIGTERM 而是别的信号时——最典型的是 nginx，它习惯用 SIGQUIT 来做优雅退出。改这一行可以让 docker stop 真正触发优雅停机，而不是等 10 秒超时后被 SIGKILL 硬杀。这正好接上第 04 章"docker stop 先发 15、等 10 秒、再发 9"的机制。</p>
+          <p>ONBUILD 是唯一一条"现在不执行、留给别人执行"的指令：它把一条指令登记到镜像里，任何以这个镜像为 FROM 的下一个 Dockerfile 都会先自动执行它。听起来很强大，实际上被广泛认为是一个陷阱。原因是<strong>它把行为藏到了看不见的地方</strong>：别人 FROM 你的镜像时，构建日志里突然多出几条他没写过的步骤，出了错完全无从下手。它破坏了"读 Dockerfile 就能知道会发生什么"这个最重要的性质。官方的构建最佳实践里明确不推荐它，所以你在新项目里应当避开——需要复用构建逻辑时，用多阶段构建里命名的阶段，或者干脆把公共部分做成一个真正的基础镜像，都比 ONBUILD 诚实。</p>
+        </details>
+
+        <p>最后补三条"知道即可"的指令。MAINTAINER 已经废弃，被 LABEL 取代，看到老教程里用它不必学。.dockerignore 不是指令而是文件，第六节专门讲。另外还有一个给镜像加签名的场景会用到 ARG 与 LABEL 的配合，第 09 章讲供应链安全时再说。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>指令</th><th>作用</th><th>产生层</th><th>生效期</th><th>最该记住的一条</th></tr></thead>
+            <tbody>
+              <tr><td>FROM</td><td>指定基础镜像</td><td>否（承接已有层）</td><td>构建期</td><td>务必写标签，别用 latest</td></tr>
+              <tr><td>RUN</td><td>执行命令并固化文件变化</td><td>是</td><td>构建期</td><td>相关命令用 &amp;&amp; 串在一层</td></tr>
+              <tr><td>COPY</td><td>从上下文复制文件</td><td>是</td><td>构建期</td><td>只能从上下文里取，越界必失败</td></tr>
+              <tr><td>ADD</td><td>复制，且支持解压与 URL</td><td>是</td><td>构建期</td><td>没有明确需求就用 COPY</td></tr>
+              <tr><td>WORKDIR</td><td>设工作目录</td><td>否</td><td>构建期并延续到运行期</td><td>别用 RUN cd 代替它</td></tr>
+              <tr><td>ENV</td><td>设运行时环境变量</td><td>否</td><td>构建期与运行期</td><td>写进去就永久留在镜像里</td></tr>
+              <tr><td>ARG</td><td>声明构建期参数</td><td>否</td><td>仅构建期</td><td>值会留在 docker history 里</td></tr>
+              <tr><td>EXPOSE</td><td>声明监听端口</td><td>否</td><td>运行期元数据</td><td>它不发布端口，-p 才发布</td></tr>
+              <tr><td>VOLUME</td><td>声明挂载点</td><td>否</td><td>运行期</td><td>会带来匿名卷，慎写</td></tr>
+              <tr><td>USER</td><td>切换用户</td><td>否</td><td>构建期与运行期</td><td>生产镜像不该以 root 跑</td></tr>
+              <tr><td>HEALTHCHECK</td><td>定义健康判断</td><td>否</td><td>运行期</td><td>unhealthy 不会自动重启</td></tr>
+              <tr><td>LABEL</td><td>贴元数据</td><td>否</td><td>只读信息</td><td>优先用 OCI 标准键名</td></tr>
+              <tr><td>CMD</td><td>默认命令或默认参数</td><td>否</td><td>运行期</td><td>会被 docker run 末尾参数整体覆盖</td></tr>
+              <tr><td>ENTRYPOINT</td><td>固定入口程序</td><td>否</td><td>运行期</td><td>末尾参数会追加给它</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>这张表里藏着本节最值得记住的一句话，我用它来收束：<strong>绝大多数指令都不产生层，只有改变文件系统的三条（RUN、COPY、ADD）才产生。所以"镜像太大"这件事，从来没有别的解释，只能去这三条指令和 FROM 里找。</strong></p>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 03 章讲层的时候留了一个问题：为什么"删除文件的那一层不会让镜像变小"。本节把它落成了两条实操纪律——RUN 内部清理缓存要写在同一个 RUN 里，以及选基础镜像时要想清楚"我能不能删掉它"。第 03 章讲镜像不是大文件、层可复用，本节又补上了它的代价：层不可变，所以"我装错了再卸掉"这种在终端里完全正常的操作，在 Dockerfile 里会留下双重体积。同一个机制，在镜像查看时是优雅，在写 Dockerfile 时是约束，这两面请一起记住。</p>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 09 章会把本节末尾关于 USER 和密钥的两条线拉直：为什么"以 root 跑容器"是一个需要写进 checklist 的问题，为什么"镜像里不该有密钥"这件事在私有依赖场景下必须靠构建期的密钥注入来解决，以及怎么用镜像扫描工具发现你选的基础镜像里潜伏着多少已知漏洞。你现在只需要记住两条准则：能不用 root 就不用；密钥绝不写进 Dockerfile 或 ENV。</p>
+        </div>
+        <h2 id="s4">CMD 与 ENTRYPOINT：把这对概念一次讲到底</h2>
+        <p>这是初学者翻车率最高的一组概念，也是这一章里最值得你花时间反复推演的部分。翻车的原因不是它复杂，而是大多数教程把它讲成了"两个都能写启动命令的指令，ENTRYPOINT 优先级更高"——这种说法只能让你在选择题里蒙对，一旦你在真实项目里遇到"我 docker run myimg bash 想进去看看，结果什么都没发生"，它就完全帮不上忙。</p>
+        <p>我们换一个入口：<strong>不要去记谁覆盖谁，而是去记这两条指令在语义上是两个不同的东西。</strong> ENTRYPOINT 是"这个镜像是哪个可执行文件"，CMD 是"不给参数时用哪些默认参数"。这个区分有一个特别好用的类比：如果镜像是命令，那么 ENTRYPOINT 是命令名，CMD 是默认参数。以 ENTRYPOINT ["python"] + CMD ["app.py"] 为例，运行这个镜像等价于运行 python app.py，而你 docker run myimg other.py 等价于运行 python other.py——参数被替换了，命令没变。</p>
+
+        <div class="block metaphor">
+          <span class="bt">比 喻</span>
+          <p>把镜像当成一把电动螺丝刀。ENTRYPOINT 是这把工具"是什么"——一把螺丝刀，这个身份不能被你临时改变；CMD 是它出厂预装的批头——默认是十字的，你完全可以换一个一字的上去。而你 docker run 时在镜像名后面写的那串东西，是"我要换上的那个批头"。所以你写得再长，它也装不到别的工具上去：它只会被插进这把螺丝刀的夹头里。</p>
+          <p>回到技术本体：这条比喻解释了两件事。第一，ENTRYPOINT 不会因为你在 docker run 后面写了别的而被替换（除非用 --entrypoint 显式覆盖），因为它是工具的身份。第二，CMD 被替换时是<strong>整体替换</strong>，不是追加——你写了 python app.py --verbose，那条 CMD ["app.py", "--verbose"] 就完全作废，不是"变成 app.py --verbose 再加你写的"。这一点和很多人第一直觉相反，务必确认清楚。</p>
+        </div>
+
+        <h3 id="s4-1">四种组合的运行结果推演</h3>
+        <p>空谈容易糊涂，我们把四种组合摆开，逐一推演"docker run 时不写参数"与"写参数"会发生什么。请你在读这张表之前先自己猜一遍结果，再看答案，这个动作能让记忆牢固得多。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>镜像里的写法</th><th>docker run img</th><th>docker run img 参数X</th><th>docker run --entrypoint 别的 img</th></tr></thead>
+            <tbody>
+              <tr><td>只有 CMD ["python","app.py"]</td><td>执行 python app.py</td><td>执行 参数X（CMD 被整体覆盖）</td><td>只指定入口，CMD 仍在，等价于 别的 app.py</td></tr>
+              <tr><td>只有 ENTRYPOINT ["python","app.py"]</td><td>执行 python app.py</td><td>执行 python app.py 参数X（追加）</td><td>执行 别的（ENTRYPOINT 被替换，无 CMD 可追加）</td></tr>
+              <tr><td>ENTRYPOINT ["python"] 加 CMD ["app.py"]</td><td>执行 python app.py</td><td>执行 python 参数X（CMD 被覆盖，ENTRYPOINT 保留）</td><td>执行 别的 app.py</td></tr>
+              <tr><td>ENTRYPOINT ["python","app.py"] 加 CMD ["--help"]</td><td>执行 python app.py --help</td><td>执行 python app.py 参数X（CMD 被覆盖）</td><td>执行 别的 --help</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>这张表值得你反复看，直到能凭直觉填出来。它同时告诉你一个重要的工程结论：<strong>如果你希望这个镜像"只能干一件事、参数可调"，就用 ENTRYPOINT 加 CMD 的组合；如果你希望这个镜像"默认跑某个东西、但允许使用者完全换成别的命令"，就只用 CMD。</strong>通用基础镜像（比如 alpine、ubuntu）只用 CMD 甚至不写，因为它们的使用者会自己做各种不同的事；而一个专用服务镜像（比如你写的 app）用 ENTRYPOINT 加 CMD，因为它就该跑这个程序，你只允许调参。</p>
+
+        <h3 id="s4-2">exec 形式与 shell 形式：一个空格引发的信号灾难</h3>
+        <p>现在进入本节最关键、也最容易被跳过的部分。上面所有例子我都用了 ["python","app.py"] 这种写法，它叫 exec 形式，也叫 JSON 数组形式。另一种写法是 CMD python app.py，叫 shell 形式。<strong>它们不是同一个东西的两种写法，它们的运行时行为有实质差别。</strong></p>
+        <p>区别在于 shell 形式会被自动包一层：CMD python app.py 实际执行的是 /bin/sh -c "python app.py"。于是容器里的进程树变成这样——PID 1 是 /bin/sh，python 是它的子进程。这个多出来的一层 sh 带来了三个真实的后果。</p>
+        <p><strong>后果一：信号送不到真正的应用。</strong>第 04 章讲过 docker stop 会向容器的 PID 1 发 SIGTERM，等 10 秒，超时再发 SIGKILL。信号是发给 PID 1 的。当 PID 1 是那个 sh 时，SIGTERM 打在 sh 身上；而很多 shell 实现并不会把信号转发给子进程，于是你的 Python 应用收不到"请你优雅退出"的通知，它继续跑，10 秒后被 SIGKILL 硬杀。表现出来就是：每次 docker stop 都要等满 10 秒，或者你的应用总是来不及保存数据、关闭连接就没了。这不是你的应用写得不好，是你少写了那个方括号。</p>
+        <p>后果二：变量展开的时机和主体不同。shell 形式里，$APP_PORT 这类写法会被那个 sh 展开；exec 形式不经过 shell，所以 $APP_PORT 不会被展开——它会原样作为参数传给程序。这解释了两个看似矛盾的现象：为什么我在 ENV 里设了 $PORT 在 JSON 形式里没生效（因为没人替你展开），以及为什么我想传一个字面量 $HOME 却先被 shell 吃掉了。要记住的原则是：<strong>exec 形式的参数是"原样的字符串数组"，它不经过任何 shell 解释</strong>，所以环境变量展开这一步要么不做，要么显式地再包一层 shell 去做。</p>
+        <p><strong>后果三：那个 sh 成了 PID 1，还要承担回收子进程的责任。</strong> Linux 的 1 号进程负责收养孤儿进程并回收退出状态，否则会积累僵尸进程。sh 未必称职，你的应用进程更不可能称职。</p>
+        <p>因此，推荐的写法非常清楚：<strong>优先用 exec 形式的 ENTRYPOINT，配 exec 形式的 CMD。</strong>只有当你确实需要 shell 的特性（管道、变量展开、多条命令串联）时，才考虑 shell 形式，并且明白自己承担了上面三条代价。真要在一个需要 shell 特性的镜像里保住信号处理，办法有两个：装一个微型 init 当 PID 1（tini、dumb-init 这类工具），或者用 SHELL 指令改换成能正确转发信号的解释器（SHELL ["/bin/bash", "-c"] 在 bash 下可以把信号转发给最后一条前台命令，但这一层细节属于"知道可以去查证"的深度）。</p>
+
+        <h3 id="s4-3">那个经典陷阱，以及怎么亲手踩一次</h3>
+        <p>现在揭晓本章开头提到的那种失败：为什么有人写了一个镜像，然后 docker run myimg -it bash 完全没反应？因为他写的是 shell 形式的 ENTRYPOINT：</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.20
+ENTRYPOINT ["echo", "this is the exec form"]
+CMD ["default-arg"]
+EOF
+docker build -t cmddemo:exec .
+docker run --rm cmddemo:exec
+docker run --rm cmddemo:exec hello 参数
+docker run --rm --entrypoint sh cmddemo:exec -c "echo 我用 --entrypoint 强行换掉了入口"
+
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.20
+ENTRYPOINT echo "this is the shell form"
+EOF
+docker build -t cmddemo:shell .
+docker run --rm cmddemo:shell hello 参数</code></pre>
+        <p class="cmd-note">逐个看结果。第一个镜像用 exec 形式，所以 docker run cmddemo:exec 输出 this is the exec form default-arg；加上 hello 参数后，输出变成 this is the exec form hello 参数——注意 default-arg 消失了，因为 CMD 被整体替换。--entrypoint 那条展示了唯一的强制覆盖方式。第二个镜像用 shell 形式，docker run 后面写的 hello 参数根本进不了那条指令——输出永远只是 this is the shell form，因为 /bin/sh -c 只拿到了这一条命令文本，你在 run 后面写的东西被当成它的参数塞进去，而它并不使用它们。这就是"docker run myimg -it bash 失效"的同一种病。</p>
+
+        <p>还有一个办法可以让你不必相信任何人的解释，直接看引擎记下来的事实：</p>
+
+        <pre data-lang="bash"><code>docker inspect -f "{{.Config.Entrypoint}} --- {{.Config.Cmd}}" cmddemo:exec
+docker inspect -f "{{.Config.Entrypoint}} --- {{.Config.Cmd}}" cmddemo:shell</code></pre>
+        <p class="cmd-note">第一条输出两个数组，你能看到 Entrypoint 与 Cmd 确实是两个独立字段，各自存成一个字符串数组。第二条只输出一个三元组，内容是 [/bin/sh -c echo "this is the shell form"]——<strong>"shell 形式会包一层 /bin/sh -c"这句话，在这里变成了你亲眼看到的配置内容。</strong></p>
+
+        <p>为了让信号这件事变得可观察，我们再做一个对比实验。用同一条命令跑两个容器，一个用 exec 形式，一个用 shell 形式，然后测量 docker stop 花了多长时间：</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12-slim
+COPY sig.py /sig.py
+ENTRYPOINT ["python", "/sig.py"]
+EOF
+docker build -t sig:exec .
+docker run -d --name s-exec sig:exec
+docker stop s-exec
+
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12-slim
+COPY sig.py /sig.py
+ENTRYPOINT python /sig.py
+EOF
+docker build -t sig:shell .
+docker run -d --name s-shell sig:shell
+docker stop s-shell</code></pre>
+        <p class="cmd-note">sig.py 的内容你应该自己写，二三十行足够：注册一个 SIGTERM 处理函数，收到信号时打印一行"我收到了信号，正在清理"，然后退出；主循环每秒打印一次心跳。用小命令即可完成：printf 或 heredoc 写进当前目录。对比两次 docker stop 的耗时，用 Measure-Command { docker stop s-exec } 在 PowerShell 里计时，或者在 WSL 里用 time。exec 形式下你会立刻看到那行"我收到了信号"，stop 几乎瞬间返回；shell 形式下那行不会出现，命令大概要等满 10 秒——那个 10 秒就是第 04 章讲过的超时。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>还有一种半错半对的写法值得点出来：CMD ["python", "app.py", "$APP_PORT"]。作者以为 $APP_PORT 会被展开成环境变量，实际上 exec 形式的参数原样传递，你的程序会收到一个字面上写着美元符号的字符串。要展开变量，得显式地请 shell 来做，例如 CMD ["sh", "-c", "python app.py --port $APP_PORT"]。但请注意，这么写就又把 sh 请回来当 PID 1 了，信号问题重新出现。所以在真实项目里更常见的做法是：让应用自己读环境变量（os.environ、process.env 这类方式），而不要依赖命令行展开。这个设计选择背后其实是一条更重要的原则：<strong>配置通过环境进入应用，而不是通过命令行拼装</strong>，这正是十二要素应用里那条"配置存于环境"的落地方式。</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>如果 shell 形式有信号处理、变量展开、僵尸进程三个问题，那它为什么会被设计出来、而且至今还是合法写法？一种"有明确缺点却长期存在"的设计，通常说明它满足了某个真实需求。你能猜出那个需求是什么吗？
+              <span class="sub">提示：想想初学者第一次写 Dockerfile 时最想写的是什么，以及 exec 形式要求你做的第一件事是什么。</span>
+            </li>
+            <li>你的服务需要在启动前把一个配置文件从模板渲染出来（比如把环境变量填进 nginx.conf），这个动作必须发生在主进程之前。你会怎么设计这一步？直接写 shell 形式的 CMD 简单，但那会牺牲信号处理。请给出至少两种方案，并说明各自把复杂度放在了哪里。
+              <span class="sub">提示：可以在镜像里放一个入口脚本，也可以让程序自己承担这件事，二者对"镜像的接口应当多简单"这个问题给出不同答案。</span>
+            </li>
+          </ol>
+        </div>
+
+        <details>
+          <summary>展开：为什么不建议用 docker run 末尾参数来"接管"一个服务镜像</summary>
+          <p>你已经知道 docker run myimg bash 能不能生效取决于镜像怎么写。反过来看这件事也很有意思：一个生产服务镜像如果留了"使用者可以随意替换成任意命令"的口子（只写 CMD），那么一次误操作 docker run myimg ls 就会让容器立刻退出，而运维看到的现象是"服务起不来、退出码 0"——排障时最讨厌的那种失败。只写 ENTRYPOINT 加 CMD 的镜像在这方面更"坚固"：入口被钉死，你只能调参数。</p>
+          <p>这就是"接口设计"的思路在 Dockerfile 里的体现：<strong>你希望使用者能做的事越少，你就越应该用 ENTRYPOINT。</strong>排障时确实会不方便——想进容器看看却没有 shell，得靠 docker run --entrypoint sh 或 docker exec。这是刻意的取舍：日常便利换来了误操作空间的收窄。上一节讲的 distroless 思路是同一个取舍的极端版本，它把 shell 从镜像里彻底删掉了。</p>
+        </details>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 11 章讲 AI 场景时会重新遇到这里的知识，而且带着更大的赌注。深度学习环境里常见的一种写法是把 Jupyter 或者一个交互式训练脚本当作入口，而训练任务动辄跑十几个小时，被 SIGKILL 硬杀的代价是几小时的计算白费。到那时你会真切地感到，"CMD 用 exec 形式还是 shell 形式"这种看起来像语法洁癖的细节，实际上是在决定你的 GPU 时间是浪费还是保住。第 10 章也会从另一面接上这段：流水线和编排系统都靠信号来优雅停止容器，写错了的 ENTRYPOINT 会让滚动升级变得又慢又脏。</p>
+        </div>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>"预测再验证"是掌握这类语义细节最快的方法。面对任何一条命令与镜像的组合，先在纸上写出你认为会发生什么，再实际跑一遍。<strong>凡是预测和结果不一致的地方，就是你知识里的洞。</strong>我在这一节里刻意给了好几组对照实验，它们本身价值有限，真正的价值是这套动作：先猜、再跑、再看差异、再回到文档找原因。这套动作值得你对本章其他所有知识点重复一遍——尤其第七节的缓存，缓存的行为比 CMD 更难靠猜，但只要你养成了"跑之前先预测哪些层会 CACHED"的习惯，你对构建过程的理解会迅速超过大多数人。</p>
+        </div>
+
+        <h2 id="s5">构建上下文与 .dockerignore：那个点到底意味着什么</h2>
+        <p>现在回来解决第一节里埋下的那个点。docker build -t myapp:0.1 . 里结尾的那个点，是初学者最不容易意识到其重量的一处语法。它的意思是"我要交出去的东西是当前目录"——而"交出去"这个词是字面意义上的：构建引擎不一定跑在你的笔记本上（第 02 章讲过 Docker Desktop 在 Windows 上是通过 WSL2 里的一台 Linux 虚拟机跑的），所以<strong>这个目录的内容要先被打包、传输到构建引擎那边</strong>。这个被打包发送的目录集合，就叫构建上下文。</p>
+        <p>这就解释了一个很多人遇到过的诡异现象：镜像还没开始构建，你就看到一行输出写着 transferring context，然后卡了很久，甚至卡到几 GB。那时构建引擎正在把你整个目录（包括 node_modules、.git、你放在项目根目录的那几个数据集、下载文件夹里忘记删掉的压缩包）打包传输。<strong>它和你 Dockerfile 里写了什么完全无关</strong>——上下文是发送阶段的事，早于任何一条指令的执行。</p>
+
+        <pre data-lang="bash"><code>docker build --progress=plain -t ctxdemo:1 .</code></pre>
+        <p class="cmd-note">--progress=plain 让 BuildKit 放弃动态刷新的进度界面，改成逐行打印完整日志。在排障时这个参数价值极高，因为它把每一步的详细输出都留在终端里，你能看到"发送上下文用了多久、哪些步骤命中了缓存"。日常构建成功时用默认界面看着更舒服，一旦出问题就立刻换 plain。</p>
+
+        <h3 id="s5-1">为什么 COPY ../ 不行</h3>
+        <p>这个问题几乎每个人都会问一次：我的源码在上一级目录，为什么不能 COPY ../src /app？因为构建引擎在"它自己的世界"里工作，而那个世界的地图只有你交给它的这一份上下文。<strong>上下文是构建引擎能看到的世界边界。</strong>边界之外的东西既没有传输过去，也没有对应的路径，所以任何试图走出去的引用都会被拒绝——构建引擎会直接报错，而不是悄悄失败。这个设计不是限制，而是安全与可复现性的基础：如果构建过程能随意读取宿主机上的任意路径，那么"同样的 Dockerfile 在不同机器上构建出一致的镜像"这个承诺就破产了，别人的机器上可能根本没有那个文件。</p>
+        <p>遇到这个需求时的正确做法，是改变构建的发起位置与上下文范围。常见解法有两条：把 docker build 的上下文参数改成上一级目录（docker build -t x ..），然后在 Dockerfile 里用 COPY src/ /app/src/ ——代价是上下文变大了，所以要配好 .dockerignore；或者在上一级目录里放 Dockerfile 并用 -f 参数指定它的位置：docker build -t x -f docker/Dockerfile . ——这是真实项目里最推荐的布局，代码在仓库根，Dockerfile 放在 docker/ 子目录，构建命令在仓库根执行。<strong>记住 -f 只指定 Dockerfile 的路径，它不改变上下文的范围</strong>，混淆这两件事是另一个常见坑。</p>
+
+        <h3 id="s5-2">.dockerignore：每个项目的必备文件</h3>
+        <p>解决上下文过大的工具是 .dockerignore，一个放在构建上下文根目录的忽略规则文件，语法与 .gitignore 高度相似：一行一条规则，支持通配符，! 开头表示"不排除这个"，# 开头是注释。它的作用只有一个，但收益有三份：构建更快（少传输大量无关文件）、镜像更小（避免把垃圾拷进去）、<strong>更安全</strong>（避免把 .env、密钥、私钥一起打进镜像）。</p>
+        <p>它为每个项目都该有，因为默认情况下上下文是"整个目录"，而现代项目的根目录里塞满了不该进镜像的东西。下面是一份可以直接拿去用的起始版本，覆盖了绝大多数语言场景：</p>
+
+        <pre data-lang="bash"><code>cat &gt; .dockerignore &lt;&lt;'EOF'
+# 版本控制与编辑器
+.git
+.gitignore
+.vscode
+.idea
+
+# 依赖与构建产物：镜像里会重新安装或重新构建
+node_modules
+__pycache__
+*.pyc
+.venv
+venv
+dist
+build
+target
+
+# 本地环境与密钥
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+
+# 日志与临时文件
+*.log
+logs
+tmp
+.DS_Store
+
+# Docker 自身
+Dockerfile*
+docker-compose*
+EOF</code></pre>
+        <p class="cmd-note">写完之后，构建输出里那行 transferring context 的耗时会有明显变化，尤其是当你的项目里有 node_modules 时——一个装了中等规模依赖的前端项目，node_modules 常常有几百 MB 到 1 GB、几十万个文件，而它在镜像里根本不该出现（第 5 节的必做实验会让你亲眼看到不忽略它的后果）。</p>
+
+        <p>关于 .dockerignore 有几个细节值得知道。第一，它的规则只影响"发不发送给构建引擎"，不影响 Dockerfile 能写什么；第二，<strong>ADD 从 URL 下载的文件不受 .dockerignore 约束</strong>，因为那根本不是上下文里的文件；第三，.dockerignore 本身不产生层，它不是 Dockerfile 指令；第四，如果你的 Dockerfile 不在上下文根目录（用 -f 指定），Dockerfile 的路径与 .dockerignore 的查找位置仍然按上下文根和 Dockerfile 各自的位置来定，这种组合场景建议你自己动手验证一次，观察哪些文件被排除了。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>Windows 用户有两个额外的雷。第一个是行尾符：如果在 Windows 上用某些编辑器保存了一个带 CRLF 行尾的 shell 脚本或 Dockerfile，再 COPY 进 Linux 容器执行，你会看到一些非常难懂的报错，比如 "exec format error" 或者解释器找不到路径，因为它们来自脚本第一行那个多出来的回车。解决办法是把编辑器配成 LF，或者在 .gitattributes 里声明。<strong>第二个是 .dockerignore 里的反斜杠</strong>：它是 Linux 路径语义，通配符与目录分隔符都该用正斜杠，在 Windows 上写 .dockerignore 时也要写 node_modules 而不是 node_modules\，否则规则不会按你预期的方式匹配。</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>如果构建引擎能看到的世界只有上下文，那么"构建的可复现性"是不是就完全由上下文和 Dockerfile 决定了？请找出至少一种"两者都没变、但构建结果会变"的情况，并说明它暴露了这个模型的一个什么边界。
+              <span class="sub">提示：回想第一节习题里那个关于 apt 源的问题。</span>
+            </li>
+            <li>.dockerignore 让构建更快、镜像更小、还更安全，那为什么它不是强制的、为什么 Docker 不默认排除 .git 和 node_modules？如果官方真的这么做了，会有什么坏处？
+              <span class="sub">提示：想一想"工具替你做决定"的边界在哪里，以及有没有项目真的需要把某个被普遍认为该排除的目录放进去。</span>
+            </li>
+          </ol>
+        </div>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 02 章讲 Docker 架构时，我说过"你敲的 docker 命令其实是一个 HTTP 请求"。构建上下文这个概念正是那条知识的直接后果：既然构建引擎可能跑在另一台机器（Docker Desktop 的 Linux 虚拟机）上，那么"构建所需的文件必须先送过去"就是必然的，而不是设计者的随意选择。第 04 章你已经在宿主机和容器之间用过 docker cp 搬文件，思路相通——只是构建这一步的搬运是自动发生的，所以你容易忘记它存在，直到它卡住你。</p>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 08 章讲 Compose 时，你会看到一条 build: 字段，它相当于把今天的 docker build 命令写进了声明文件，也会遇到 .dockerignore 在多服务项目里的位置问题。第 10 章讲流水线时，"构建上下文有多大"会变成一个会花钱的问题：CI 环境每次构建都从零开始，多传 1 GB 上下文意味着每次流水线都多花几分钟和相应的费用。现在把 .dockerignore 养成习惯，那时候你会感谢自己。</p>
+        </div>
+        <h2 id="s6">构建缓存：为什么指令顺序就是开发体验</h2>
+        <p>现在到了本章的技术核心。前面我反复提到"层顺序""缓存命中""改一行代码重建几层"，是时候把它讲成一个可以预测的机制了。你只需要理解一件事：<strong>构建引擎不会思考，它只会比较输入</strong>。</p>
+        <p>每一条会产生层的指令（RUN、COPY、ADD），构建引擎都会为它算一个缓存键。这个键由三样东西拼起来：父层的标识（也就是上一条指令产生的那一层的哈希）、这条指令的完整文本（包括你写的所有参数）、以及这条指令的输入文件内容哈希（对 COPY 和 ADD 来说，就是被复制文件的内容）。三者全都一致，引擎就认为"这一步的输入和上次完全一样，输出必然也一样"，于是跳过执行，直接复用已有的层，在日志里打印一行 CACHED。任何一样不一致，这一步和它之后的<strong>所有</strong>步骤都要重新执行——注意这句话里的"所有"，这是缓存机制里最重要的一条推论，因为它意味着缓存是链式的：一层失效，链上后面全部失效。</p>
+        <p>这里有个反直觉但极其重要的细节：<strong>RUN 指令的缓存键里不包含命令的执行结果。</strong>引擎不知道也不关心你那条 apt-get install 今天会下载到什么版本的包，它只比较"父层 + 指令文本"是否一致。COPY 之所以特殊，是因为它的输入里有文件内容，所以改一个字节就会失效——这也解释了为什么"改一行代码"会导致 COPY 那一层及之后重建，而 COPY 之前的依赖安装层安然无恙。</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY . .
+CMD ["node", "server.js"]
+EOF
+docker build -t cacheorder:good .
+docker build -t cacheorder:good .
+docker build -t cacheorder:good .</code></pre>
+        <p class="cmd-note">连跑三次，仔细看输出。第二次和第三次里，每一步前面都会出现 CACHED，整个构建在几百毫秒内结束——这一次构建几乎没有做事，只是把三份软件里的记录重新拼了一遍。这就是"顺序正确"的日常体验：什么都没改的时候，构建几乎不花时间。npm ci 而不是 npm install 是另一个值得记的选择：ci 严格按 lock 文件安装，不会顺手更新 lock，构建结果因此稳定得多。</p>
+
+        <h3 id="s6-1">亲手制造一次缓存失效</h3>
+        <p>光看 CACHED 不够，我们要主动制造失效，看清"链式"到底是怎么断的。这个过程请务必自己敲一遍：</p>
+
+        <pre data-lang="bash"><code>echo "// 改动 $(Get-Date -Format o)" &gt;&gt; server.js
+docker build -t cacheorder:good .
+docker run --rm cacheorder:good node --version
+docker system df</code></pre>
+        <p class="cmd-note">第一行在 server.js 末尾追加一行注释，让这个文件的内容变化（这里用的是 PowerShell 的写法，Get-Date -Format o 生成一个 ISO 格式的时间戳；在 WSL 里可以用 date）。再次构建时你会看到关键现象：COPY package.json package-lock.json ./ 这一步仍然是 CACHED，RUN npm ci 这一步仍然是 CACHED——<strong>依赖没有被重新安装</strong>——而它后面的 COPY . . 这一步失效并重建，最终镜像重新打包。在依赖安装真正常常要花一两分钟的 Python 或 Java 项目里，这个差别就是"三秒"和"三分钟"。最后一条 docker system df 会让你看到构建缓存占用的空间统计，你往往会惊讶于它比自己以为的大。</p>
+
+        <p>接着做对照实验，把顺序换过来，你能体会到另一种痛苦：</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY . .
+RUN npm ci --omit=dev
+CMD ["node", "server.js"]
+EOF
+docker build -t cacheorder:bad .
+echo "// 再改一次 $(Get-Date -Format o)" &gt;&gt; server.js
+docker build -t cacheorder:bad .</code></pre>
+        <p class="cmd-note">这次第二次构建里，COPY . . 失效，于是紧随其后的 RUN npm ci 也失效——整棵依赖树重新下载安装。两个镜像的功能一模一样，代码也一模一样，唯一的区别是两行指令的先后顺序；代价是每天几十次构建里，每次多等一到几分钟。我把这两者分别叫 good 和 bad 不是在开玩笑：<strong>这是 Dockerfile 里"一行顺序差出十倍效率"的最典型案例。</strong>请你把两次构建的耗时数字记在自己的笔记里，那个具体数字比任何道理都有说服力。</p>
+
+        <h3 id="s6-2">缓存的反模式清单</h3>
+        <p>把常见的"破坏缓存"写法列清楚，你以后看别人的 Dockerfile 就能一眼扫出来：</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>反模式</th><th>为什么毁掉缓存</th><th>正确做法</th></tr></thead>
+            <tbody>
+              <tr><td>COPY . . 放在依赖安装之前</td><td>源码一动，依赖那层跟着失效，整棵依赖树重装</td><td>先 COPY 依赖清单并安装，再 COPY 源码</td></tr>
+              <tr><td>RUN apt-get update 单独一层</td><td>索引层被长期缓存，安装时拿到过期的包列表</td><td>与 install 写进同一个 RUN</td></tr>
+              <tr><td>构建时下载大文件或 git clone 仓库</td><td>父层不变时永远命中旧内容，拉不到更新；网络抖动直接失败</td><td>固定版本与校验值，或把依赖固化进基础镜像</td></tr>
+              <tr><td>把整个项目目录 COPY 进去包括 .git</td><td>每次提交都改变文件内容，缓存几乎永远失效</td><td>用 .dockerignore 排除 .git</td></tr>
+              <tr><td>把构建时间戳或随机数写进镜像</td><td>每一次构建的输出都不同，缓存完全无效且镜像不可追溯</td><td>构建产物要可复现，时间信息用标签而非文件内容</td></tr>
+              <tr><td>在依赖清单里用浮动版本</td><td>清单没变但实际装的版本变了，缓存给你一个"以为更新了"的旧结果</td><td>锁死版本，或定期用 --no-cache 重建验证</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>这张表倒数第二行值得多看一眼，因为它引出了缓存最危险的一面：<strong>缓存是加速器，也可能骗你。</strong>当你的 Dockerfile 依赖了缓存键之外的东西时——网络上的包版本、外部的构建脚本、时间——缓存会忠实地复用一个"输入看起来一样"的旧结果，而现实已经变了。最典型的场景是你更新了基础镜像的上游安全补丁，但 FROM node:20-alpine 这行文本没变，于是构建引擎仍然复用它本地那份旧的 node:20-alpine，你以为修补了漏洞，实际上没有。</p>
+        <p>应对方法有三招，都是你应该知道的干净手段：第一招是 docker build --no-cache，强制不使用任何缓存，从零重建一遍，用来验证"这个镜像到底是不是能从当前状态构建出来"。第二招是 docker build --pull，让引擎先尝试拉取更新的基础镜像，如果上游的某个标签指向了新内容，这次的缓存键就会因为基础层变了而失效。<strong>第三招是 docker builder prune</strong>，清理本地的构建缓存，这在磁盘紧张时也该做（注意它清掉的是缓存，不是镜像本身）。</p>
+
+        <pre data-lang="bash"><code>docker build --no-cache --progress=plain -t cacheorder:verify . 2&gt;&amp;1 | Select-String -Pattern "CACHED" -NotMatch | Select-Object -First 12
+docker build --pull -t cacheorder:verify .
+docker builder prune</code></pre>
+        <p class="cmd-note">第一条命令做了一件很有用的事：完全禁用缓存构建，并且把输出里含 CACHED 的行滤掉，只留下真正执行的步骤，让你看清这个镜像一次完整的构建到底做了多少事。PowerShell 里的 2&gt;&amp;1 把标准错误合并进标准输出（BuildKit 把大部分日志写在标准错误上），Select-String 是 PowerShell 版的 grep。第二条命令尝试在构建前拉取更新的基础镜像。第三条清理构建缓存，它会先问你确认，加了 -f 才会直接执行——请把这类清理命令当成需要停一秒再按回车的操作，第 04 章讲 docker system prune 时说过类似的纪律。</p>
+
+        <details>
+          <summary>展开：缓存的"上下文"也在键里，以及 --cache-from 为什么存在</summary>
+          <p>第四样东西其实也进了缓存键：构建时那个平台与构建参数。同一份 Dockerfile 用不同的 --build-arg 构建，得到的是不同的缓存链，这符合直觉——输入不同，输出不该复用。同理，CPU 架构不同（linux/amd64 与 linux/arm64）也走不同的缓存，这就是为什么在苹果芯片笔记本上构建的镜像缓存，在服务器上拉下来并不能直接用。</p>
+          <p>还有一件在 CI 场景里极其重要的事：本地缓存是存在你这台机器上的，而 CI 的构建机器每次都是一台全新的、什么都不记得的机器。所以流水线上默认享受不到任何缓存，每次构建都从零开始。解决办法是"缓存导入导出"：把上一次构建产生的缓存导出成一个镜像或一个目录，下一次构建再导入进来。第 10 章会把这件事讲成一个具体的流水线配置。你现在只需要知道，缓存是一种可以被搬运的资产，而不仅仅是你笔记本上的运气。</p>
+        </details>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>把这一节的知识压成一个可以随身携带的判断口径：<strong>"改动什么，就让它只影响它该影响的那些层。"</strong>每次写 Dockerfile 时在心里过一遍"我以后最常改的是哪个文件"，然后保证那个文件所在的 COPY 指令尽量靠后、它之前的东西尽量不要依赖它的内容。这个口径可以推广到很多工程问题上——缓存设计、增量编译、数据库索引、甚至你的复习计划，本质都是同一个问题："什么是稳定的、什么是易变的，我有没有把易变的东西放到了会影响稳定部分的位置上。"</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>如果你把一行 RUN 里加了 &amp;&amp; echo done 这种完全不影响文件系统的命令，缓存会因此失效吗？请先预测，再动手验证，然后解释你的预测为什么对或错。
+              <span class="sub">提示：回到缓存键的三个组成部分，其中"指令文本"这一项是怎么算的。</span>
+            </li>
+            <li>假设你的团队有十个人，每个人都在自己电脑上构建同一个项目。缓存究竟是被共享的还是各人一份？如果每个人都要从零安装一遍依赖，除了缓存之外还有没有别的办法能让这件事只做一次？这个问题的答案会把你带向"镜像仓库"和"基础镜像"这两个概念。
+              <span class="sub">提示：依赖安装的结果是什么？它能不能像镜像一样被分发出去？</span>
+            </li>
+          </ol>
+        </div>
+
+        <h2 id="s7">多阶段构建：把 1 GB 变成 30 MB</h2>
+        <p>先看一个具体的前后对比。假设你有一个用 Node 写的小型前端项目，用最朴素的写法构建：FROM node:20，把源码拷进去，npm install，npm run build，然后把整个目录当成产物。这个镜像的体积会是<strong>一 GB 出头</strong>——node:20 这个基础镜像本身就约 1.1 GB，再加上你的依赖、构建产物、以及构建过程中的中间文件。而它跑起来真正需要的东西是什么？是一个几十 KB 的 HTML、几百 KB 的 JS 和 CSS、加上一个静态文件服务器。</p>
+        <p>中间差的那些东西是什么？是 npm、是 node 运行时之外的一堆工具、是 node_modules 里那些只在构建时用得上的包、是构建产生的临时文件。<strong>关键洞察是：构建一个东西需要的工具，和运行这个东西需要的环境，是两份完全不同的清单。</strong>传统做法把它们硬塞进同一个镜像，只是因为"我在同一个 shell 里做完了这两件事"，这个理由在工程上不成立。多阶段构建就是把这条线划开的手段。</p>
+        <p>它的原理简单到几乎不需要解释：<strong>一个 Dockerfile 里可以写多个 FROM，每个 FROM 开启一个独立的构建阶段，阶段之间可以用 COPY --from=阶段名 互相取文件。只有最后一个阶段的产物成为最终镜像。</strong>中间那些阶段里的编译器、工具链、几百 MB 的依赖目录，因为不在最终阶段的文件系统里，所以完全不进镜像。它们只在构建缓存里留一份（这份缓存可以清理）。</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM node:20 AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:1.27-alpine AS runtime
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+EOF
+docker build -t frontend:multi .
+docker images frontend:multi
+docker history frontend:multi</code></pre>
+        <p class="cmd-note">你会在 docker images 里看到一个和 nginx:1.27-alpine 差不多大的镜像（官方 nginx alpine 变体约 50 MB 上下，你的产物加上几十 KB 到几 MB），而不再是一 GB。docker history 会告诉你一件更有意思的事：列表里的层数很少，而且与 node 完全无关——中间那个 build 阶段的所有层都不在最终镜像里。<strong>多阶段构建最有力的证据就是这条 history：你能清楚地看到"编译工具链不在这里"。</strong></p>
+
+        <p>同样的模式在 Python 项目上是另一种形态。Python 的痛点和 Node 不同：它的依赖里既有纯 Python 包（装上就是几个 .py 文件），也有需要编译的扩展包（要 gcc、要 python 开发头文件）。后者的编译过程需要一整套工具链，但编译完成后运行时只需要那个 .so 文件。所以 Python 的多阶段构建通常采用"把依赖装到指定目录，再把那个目录搬到干净镜像里"的写法：</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12 AS builder
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+FROM python:3.12-slim AS runtime
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY . .
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "app.py"]
+EOF
+docker build -t pyapp:multi .</code></pre>
+        <p class="cmd-note">--prefix=/install 让 pip 把所有东西装进 /install 这一棵目录树（可执行文件进 bin、库进 lib），然后整棵搬进运行时阶段。你会在镜像体积上看到明显下降：python:3.12 约 1 GB，python:3.12-slim 约 150 MB 上下，加上你的依赖后通常落在 200 MB 到 400 MB 之间。这里最值得注意的一点是你<strong>没有</strong>在运行时阶段删任何东西——那些构建工具压根没进来过，所以也就不存在"删了但体积没减"的问题。第 03 章讲的"删除不减小体积"这个坑，在多阶段构建里被从结构上绕开了，这是它比"一层里 apt install 再 apt purge"优雅得多的原因。</p>
+
+        <p>第三类项目是 Go 和 Rust 这样的编译型语言，它们能做到最极端的瘦身，因为编译产物是静态链接的单个可执行文件，运行时连 libc 都不需要：</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM golang:1.23 AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/server .
+
+FROM scratch
+COPY --from=builder /out/server /server
+ENTRYPOINT ["/server"]
+EOF
+docker build -t goserver:multi .
+docker images goserver:multi</code></pre>
+        <p class="cmd-note">CGO_ENABLED=0 关掉 C 语言互操作，让 Go 编译器生成一个不依赖任何系统库的静态可执行文件；GOOS=linux 明确目标系统。FROM scratch 表示最终镜像里只有这一个文件，所以体积通常落在 5 MB 到 20 MB。代价你马上就会遇到：scratch 里没有 shell，docker run -it goserver:multi sh 会失败（这恰恰说明镜像很干净）；也没有 /etc/ssl/certs 里的根证书，如果程序要发起 HTTPS 请求会报证书错误——解决办法是在构建阶段把证书文件一起 COPY 进去。<strong>这就是极限瘦身的账：每省下一 MB，你都要多知道一件"原来系统帮我做了这件事"。</strong></p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>项目类型</th><th>构建阶段需要什么</th><th>运行阶段需要什么</th><th>典型体积变化</th><th>最容易漏的一步</th></tr></thead>
+            <tbody>
+              <tr><td>前端（Node 打包）</td><td>node 完整镜像、全部开发依赖、打包器</td><td>一个静态文件服务器加产物</td><td>约 1.1 GB 降到 50—80 MB</td><td>产物目录名写错，nginx 里是空的</td></tr>
+              <tr><td>Python 服务</td><td>完整 python 镜像、编译扩展包的工具链</td><td>python 加已安装的依赖</td><td>约 1 GB 降到 200—400 MB</td><td>--prefix 与 PATH、依赖路径不一致</td></tr>
+              <tr><td>Go 服务</td><td>golang 镜像、模块缓存</td><td>一个静态可执行文件</td><td>约 800 MB 降到 5—20 MB</td><td>漏掉根证书与 CA 目录</td></tr>
+              <tr><td>Java 服务</td><td>Maven 或 Gradle 加 JDK 加依赖仓库</td><td>JRE 加一个 jar</td><td>约 700 MB 降到 150—250 MB</td><td>用了完整 JDK 而不是 JRE 基础镜像</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>关于数字，我要诚实地说明一句：上面的体积都是一个量级上的参考，具体数值取决于你选的标签版本、依赖的多少、以及构建参数。<strong>比我给的数字更可靠的做法是让你自己测</strong>：把你现在项目的朴素 Dockerfile 构建一遍，docker images 记录下来；改成多阶段再构建一遍，记录一次；两个数字的比值才是你自己的结论。你在自己的机器上看到的第一个"从 1.1 GB 到 60 MB"，比读我这张表有价值得多。</p>
+
+        <h3 id="s7-1">多阶段构建没有免费的东西</h3>
+        <p>到这里你可能已经觉得多阶段构建是万能药。它有代价，而且代价不小，我列出来让你自己权衡。</p>
+        <p><strong>第一，Dockerfile 变长、变难读。</strong>一个阶段变成两三个阶段后，读者需要同时在脑子里跟踪"我现在在哪一段、这个 /app/dist 是谁产生的"，跨阶段的文件路径成了新的出错点。当你的构建脚本复杂到一定程度，一个写错路径的 COPY --from 会给你一个空目录加一个成功状态，这种错误很难察觉。</p>
+        <p><strong>第二，构建时间可能变长。</strong>编译阶段的依赖不会被最终镜像复用，但它仍然要装一遍；用 cache 挂载能缓解，但在没有缓存的机器上（比如 CI）你等于把"装构建依赖"和"装运行依赖"两件事都做了。所以"镜像小了，但构建变慢了"是完全可能的结果，而这两者的取舍取决于你的场景：如果镜像要被推拉几十次、部署到多台机器，体积收益远大于构建时间的损失；如果你是本地反复构建调试，构建时间才更痛。</p>
+        <p><strong>第三，调试变难。</strong>中间阶段默认不会保留成镜像，所以当构建在 build 阶段失败时，你没法 docker run 进去看看现场。解决办法是用 docker build --target build 只构建到某个阶段（这条命令你值得现在就记住，它会成为你最常用的调试手段之一），或者用 --output 把中间产物导出到本地目录查看。</p>
+        <p>第四，某些场景根本用不到它。如果你的应用本身就是一个必须带全套运行时的解释器环境（比如一个需要在容器里跑 jupyter 做实验、还要临时 pip install 的数据分析环境），那些"构建工具"其实是你运行时也想用的工具，这时候硬做多阶段只会让你自己难受。<strong>优化的前提是判断"哪些东西真的不该在运行时出现"，而不是"镜像越小越好"。</strong></p>
+
+        <pre data-lang="bash"><code>docker build --target build -t frontend:debug-stage .
+docker run --rm -it frontend:debug-stage sh -c "ls -la /app &amp;&amp; node --version"</code></pre>
+        <p class="cmd-note">--target 让你停在指定的阶段，构建出来的镜像就是那个中间阶段的样子。这是排查"我的产物到底生成在哪了"最快的方法：进去看一眼目录，比反复猜路径快得多。注意 --target build 必须与 Dockerfile 里 FROM ... AS build 的那个名字完全一致——阶段名拼错时，构建引擎会明确报错说找不到这个 target，这个报错信息很好认。</p>
+
+        <details>
+          <summary>展开：阶段引用还能用序号，以及把构建产物导出到本地</summary>
+          <p>COPY --from 除了写阶段名，也可以写序号：COPY --from=0 表示从第一个 FROM 阶段取文件。这种写法在你不需要区分阶段、只图省事时可以用，但它极其脆弱——任何人往 Dockerfile 前面插一个新的 FROM，序号就全部错位，而且错位之后通常不会报"找不到"，只是取到了另一个阶段里的同名文件。<strong>所以请养成给每个阶段命名的习惯</strong>，多打几个字符换来的是改不坏的性质，这正是"可维护性"最典型的样子：付出很小，收益是长期免于某类意外。</p>
+          <p>另外，COPY --from 不仅能引用本 Dockerfile 里的阶段，还能引用任意镜像：COPY --from=nginx:1.27 /etc/nginx/nginx.conf /etc/nginx/nginx.conf 是合法写法。这意味着你可以把"从某个现成镜像里抠出一个文件"当作构建手段，比如抠配置、抠证书、抠预编译好的二进制。这个能力很强，但请谨慎使用，因为引用外部镜像意味着你的构建多依赖了一个不受你控制的输入。</p>
+          <p>还有一条常见需求值得提前知道：如果你想在不产生最终镜像的情况下把构建产物拿出来（比如让 CI 把前端产物上传到静态托管），可以用 docker build --output type=local,dest=./out，产物会直接出现在你本地的 out 目录里而不进任何镜像。这是 BuildKit 提供的一种"构建结果输出方式"，第 10 章会用上它。</p>
+        </details>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>多阶段构建把编译器从镜像里赶走了，但编译器仍然要在你机器上跑一遍，仍然要下载、要占磁盘（而且是在构建缓存里）。那么"镜像变小"这件事，究竟是谁得到了好处、谁承担了成本？在只有你一个人用、只部署一台服务器的场景里，这个取舍还成立吗？
+              <span class="sub">提示：分别列出"谁受益"和"谁付成本"，注意受益者和付成本的可能不是同一方。</span>
+            </li>
+            <li>如果你的服务在运行时会动态安装插件（比如用户上传一个插件包，程序在运行时 pip install 它），多阶段构建还适用吗？如果不适用，你会怎么改造你的镜像策略？
+              <span class="sub">提示：想一想"运行时需要的能力"这个清单有没有可能无法在构建时确定，以及这对"不可变镜像"这个原则意味着什么。</span>
+            </li>
+          </ol>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 11 章会遇到一个让多阶段构建变得棘手的场景：深度学习项目的"构建阶段"要装 CUDA 工具链、编译自定义算子，动辄几个 GB，而"运行阶段"却需要完整保留 PyTorch、CUDA 运行时、模型权重。那些巨大的东西本来就是运行时必需的，所以赶不走。到那时你会看到一个不同的优化思路——不是"删掉不需要的"，而是"把巨大的、稳定的部分抽成基础镜像，让它被多个镜像共享"。这正是本章第八节要讲的"自制基础镜像"的思路。</p>
+        </div>
+        <h2 id="s8">BuildKit 的进阶能力：缓存挂载、密钥注入与多平台</h2>
+        <p>第六节讲的缓存有一个明显的短板：它记住了"层"，但没记住"层之外的东西"。举一个具体例子，RUN npm ci 这一层被缓存了，可它下载的那几万个包文件在缓存失效后要全部重新下载——因为下载下来的包放在层里，而层被丢弃了。有没有办法让"包管理器的下载缓存"独立存在、跨构建保留？BuildKit 的缓存挂载就是干这个的，它是这一节里最实用的一项能力。</p>
+
+        <h3 id="s8-1">--mount=type=cache：让下载过的包不再重下</h3>
+        <p>它的语法出现在 RUN 指令的 --mount 参数里，形式是 --mount=type=cache,target=某个目录。含义是："把某个目录挂载成一个持久化的缓存区，构建结束后里面的内容会被保留，下一次构建时如果这个缓存还在，就能直接命中。"它和第六节的层缓存是两个不同层级的机制：层缓存决定"这一步要不要重新执行"，缓存挂载决定"这一步重新执行时，能不能少干点活"。</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+COPY . .
+CMD ["node", "server.js"]
+EOF
+docker build -t cachemount:demo .
+docker build -t cachemount:demo .</code></pre>
+        <p class="cmd-note">两次构建之间，你可以先故意改一下 package.json（加一个依赖）让 npm ci 那层失效，然后再构建：包下载的速度会明显快于第一次，因为 /root/.npm 里的内容被保留了下来。target 要填对——npm 的缓存目录在 Linux 上是 /root/.npm，pip 的缓存目录是 /root/.cache/pip，Go 的模块缓存在 /go/pkg/mod。这些路径不是猜的，你可以先在容器里跑一次 docker run --rm node:20-alpine sh -c "npm config get cache" 来确认。<strong>这个技巧的价值在 CI 上会被放大十倍</strong>，因为 CI 每次都是净机器，如果没有缓存挂载，每次流水线都要重下几百 MB。</p>
+
+        <p>缓存挂载也有它的边界，其中一条会让第一次使用的人困惑：<strong>挂在缓存目录里的内容不会进入镜像层</strong>。这是它的设计目的（缓存不该成为镜像的一部分），但如果你不小心把真正需要的产物写进了那个目录，它就会在最终镜像里消失。判断准则很简单：缓存目录只放"可以随时重新下载或重新生成的东西"。</p>
+
+        <h3 id="s8-2">--mount=type=secret：让密钥路过而不是住下</h3>
+        <p>前面我们花了很久证明"ARG 和 ENV 都会把密钥留在镜像里"。那私有依赖怎么办？答案是构建期密钥注入：密钥由构建命令在运行时提供，构建过程中以一个文件的形式出现在某个临时位置，用完即弃，<strong>不进任何一层</strong>。写起来是这样：</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN --mount=type=secret,id=pipconf,target=/etc/pip.conf \
+    pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "app.py"]
+EOF
+
+echo "[global]" &gt; pip.conf
+echo "index-url = https://内网地址/simple" &gt;&gt; pip.conf
+echo "extra-index-url = https://用户名:口令@内网地址/simple" &gt;&gt; pip.conf
+docker build --secret id=pipconf,src=pip.conf -t pyapp:secret .</code></pre>
+        <p class="cmd-note">关键在最后一条命令：密钥是通过 --secret 参数在构建时才交进去的，文件内容不会被打包进上下文，也不会留在镜像的任何一层里。验证方法很有说服力：构建完成后用 docker history --no-trunc pyapp:secret 看一遍，你找不到那串口令；再用 docker run --rm pyapp:secret env 看运行时环境变量，也没有。<strong>这就是"密钥只是路过"和"密钥住下了"之间的区别。</strong>请把 src=pip.conf 那种把口令写在配置文件里的做法改掉——它的正确形态是让 pip.conf 只读取环境变量或者由一个凭据助手提供，本章不展开，第 09 章讲密钥管理时会接上这条线。</p>
+
+        <p>还有一个更简的用法值得知道：docker build --secret id=npmrc,src=$HOME/.npmrc 这种写法可以把你本机已有的凭据文件直接交给构建使用。但请注意，这样做会让构建结果依赖"你本机有这个文件"，可复现性因此下降——它是开发时的便利手段，不适合放进流水线。密钥注入这个话题的完整形态（谁管密钥、怎么轮换、怎么审计）属于第 09 章的范围。</p>
+
+        <h3 id="s8-3">多平台构建与构建元数据</h3>
+        <p>如果你要构建一个同时能在你的 Windows 笔记本（x86-64）和同学的苹果笔记本（arm64）上跑的镜像，就需要多平台构建。它的命令形态是 docker buildx build --platform linux/amd64,linux/arm64，输出的是一份"多平台镜像清单"，拉取时会自动匹配当前架构。这件事在本地容易踩到的坑是：跨架构构建会走模拟（QEMU），速度很慢，而且某些依赖安装脚本在模拟环境下会失败。真实工程里更常见的做法是让 CI 分别在两种架构的机器上各自构建，再合并成一份清单。</p>
+        <p>最后一项是构建元数据。BuildKit 默认会为镜像附加一份来源证明（provenance），记录这次构建用了哪些输入；还可以通过参数生成软件物料清单（Software Bill of Materials，SBOM），列出镜像里包含的组件清单。它们的意义是供应链安全：当你需要回答"这个镜像里到底有哪些包、是哪个流水线在哪台机器上用哪份源码构建的"，答案就在这些元数据里。这是第 09 章的主题，现在你只需要知道存在这件事，并且知道它默认是开着的——如果你的镜像仓库因为多了这些附加信息而提示大小变化，那是正常现象。</p>
+
+        <details>
+          <summary>展开：BuildKit 为什么能并行，以及它对 Dockerfile 的可读性做了什么</summary>
+          <p>旧构建器是"一步一步走"的：按顺序执行每条指令，前一条完成才走后一条，所以一个多阶段构建的各个阶段也是串行跑完的。BuildKit 把整个构建看成一个依赖关系图：哪些步骤互相依赖、哪些可以同时进行，它自己算。多阶段构建里两个互不相关的阶段因此可以并行执行，这是 BuildKit 带来的实际收益之一。它还改了输出的呈现方式：默认的进度界面是一堆动态刷新的行，看起来像在"同时做很多事"，而 --progress=plain 会退回逐行日志。</p>
+          <p>对写 Dockerfile 的人来说，还有一个重要的变化：BuildKit 允许 RUN 的 --mount 参数，而旧构建器不支持；它也改变了缓存的判定粒度，对某些指令的缓存更精细。这些差异造成了一个实践上的提醒：<strong>当你在网上找到一份老教程、按它做却没得到它说的结果时，先确认它写于哪个时代。</strong>这不是让你不信资料，而是提醒你技术资料有保质期，而验证成本在你手上其实很低——一条命令跑一遍就知道了。</p>
+        </details>
+
+        <h3 id="s8-4">基础镜像的选择：五种起点与一棵决策树</h3>
+        <p>这一节回到最上游的那个决定。FROM 那一行决定了镜像的体积下限、兼容性上限、以及你未来会遇到哪一类奇怪的报错。我把五种常见起点摆在一起，然后给你一棵可以照着走的决策树。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>起点</th><th>粗略体积</th><th>兼容性</th><th>调试便利</th><th>攻击面</th><th>最适合的场景</th></tr></thead>
+            <tbody>
+              <tr><td>ubuntu / debian</td><td>70—120 MB</td><td>最好，glibc 生态完整</td><td>最好，工具齐全</td><td>较大</td><td>需要编译、需要 apt、追求"不出意外"</td></tr>
+              <tr><td>debian:12-slim</td><td>70—80 MB</td><td>好，仍然是 glibc</td><td>可用，工具较少</td><td>中</td><td>运行时的通用默认选择</td></tr>
+              <tr><td>alpine</td><td>约 8 MB</td><td>有风险，musl libc 与 glibc 不兼容</td><td>有 sh 但工具是 busybox 精简版</td><td>小</td><td>体积敏感、依赖简单的服务</td></tr>
+              <tr><td>distroless</td><td>20—80 MB</td><td>与所选运行时一致</td><td>很差，没有 shell、没有包管理器</td><td>最小</td><td>安全要求高、部署后不再改动</td></tr>
+              <tr><td>scratch</td><td>0（只有你放的东西）</td><td>没有，一切自备</td><td>几乎无法调试</td><td>最小</td><td>静态编译的单文件程序</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>关于 Alpine 那行里的"有风险"，值得展开一点，因为它是本章里最常被误解的取舍。Alpine 使用 musl libc 而不是大多数 Linux 发行版使用的 glibc。多数纯 Python、纯 Go、纯 JS 的东西对此毫无感觉，但一旦涉及预编译好的二进制 Wheel 或 .so 文件就会出问题：PyPI 上大部分包的预编译版本是针对 glibc 和特定架构构建的，在 musl 环境下找不到可用的 Wheel，pip 于是退回去从源码编译——而 Alpine 的镜像里默认没有 gcc、没有 python 开发头文件、没有 make，所以它会以一堆看不出重点的编译错误失败。这就是为什么很多官方镜像（包括 python 官方镜像）的默认标签仍然基于 Debian：<strong>它们的首要目标是"你 pip install 什么都不出意外"，而不是"体积最小"。</strong>体积是可以优化的，兼容性事故是会让用户流失的。</p>
+        <p>把选择过程写成一串可以照着答的问题，比背表格有用：</p>
+        <p>第一问：我的程序是静态编译好的单个可执行文件吗？ 是，就考虑 scratch（记得带上根证书和时区文件）；不是，往下走。第二问：我需要在容器里编译任何东西吗（包括在运行时由 pip 或 npm 现场编译）？ 需要，就选 Debian 或 Ubuntu 系列，别贪那几十 MB。第三问：我有额外的安全或合规要求吗？ 有，考虑 distroless，同时接受"以后排障会更难"这个代价。第四问：我的依赖里有没有预编译二进制、有没有和系统库打交道的东西？ 有，别用 Alpine，除非你确认过它们都有 musl 版本。<strong>第五问：上面几问都无所谓，我只想要一个稳妥的默认值。</strong>那就用官方镜像的 slim 变体（python:3.12-slim、node:20-slim 这类），它们在体积和兼容性之间给了一个合理的折中。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>换基础镜像是一件比看起来危险的事。从 node:20 换成 node:20-alpine 在本地测试可能完全正常——因为你的依赖恰好都是纯 JS 的；等哪天有人引入了一个带原生扩展的包，构建就在别人机器上红了，而那时你早就忘了自己换过基础镜像。<strong>所以换基础镜像必须当成一次需要验证的改动</strong>：完整构建一遍、跑一遍测试、确认所有依赖都能装上。同理，把 ubuntu:latest 换成 ubuntu:24.04 也要验证，因为默认的 shell、包名、路径都可能变。教训是通用的：凡是"看起来只改了一个词"的改动，都要问自己"这个词影响的面有多大"，基础镜像这个词影响的面是整个镜像。</p>
+        </div>
+
+        <h3 id="s8-5">减重清单与"不要过度优化"</h3>
+        <p>把本章所有减重手段汇总成一张可执行的清单，你以后可以照着逐条过一遍：</p>
+        <p>一是换更小的基础镜像，但守住上面那棵决策树的边界。二是用多阶段构建，把编译工具链和构建期依赖留在中间阶段。三是写好 .dockerignore，别把 node_modules、.git、数据集、日志带进上下文。四是把清理动作写进同一个 RUN，特别是 apt 的索引目录和 pip、npm 的缓存目录。五是合并相关的 RUN，让"装了又删"发生在同一层里。六是用 --no-install-recommends 之类的参数，别装那些"顺手带上的东西"。七是让 COPY 精确到需要的文件，而不是 COPY . . 一把梭（这在依赖安装那一步尤其重要）。<strong>八是检查你的依赖里有没development-only 的包混进了运行时环境</strong>，比如 pytest、webpack、各种 CLI 工具。</p>
+        <p>但这份清单有一个使用说明必须写在前面：<strong>每一条都有成本，而且成本会累积。</strong>合并 RUN 会让 Dockerfile 行变长、可读性下降；精确 COPY 会让每次加一个文件都要改 Dockerfile；换 Alpine 会带来兼容风险；上 distroless 会让排障变难。更微妙的是，过度优化往往制造出"只有作者看得懂"的 Dockerfile——而它的维护者是三个月后的你，或者接手你项目的那位同学。</p>
+        <p>所以我给你一个判断尺度：<strong>先问"这个镜像会被拉取和部署多少次"。</strong>如果它每天被拉取上千次、部署在几十台机器上，那么每一 MB 都在乘以次数，值得你花时间抠。如果它只是一个课程设计，一周构建两次、在你自己机器上跑，那么把 200 MB 优化到 60 MB 的收益，远小于你为此失去的可读性和调试能力。省下的一百多 MB 在你的硬盘上几乎无感，而你因为看不懂自己的 Dockerfile 而浪费的那个下午，是真实发生的。</p>
+
+        <blockquote><p>优化的目标从来不是"最小"，而是"在你能维护的复杂度里，刚好够好"。</p></blockquote>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>做完任何优化之后，请做一次"回头验证"，而且验证的对象不是你想要的指标，而是你可能破坏的东西。改小了镜像，就确认程序还能跑、依赖还齐全、健康检查还通过；换了基础镜像，就跑一遍测试；合并了 RUN，就重新跑一次 --no-cache 构建确认没有依赖上层的残留文件。<strong>优化与破坏在体感上非常像——两者都只留下一句"构建成功"，差别要等你真正运行它才浮现。</strong>这个习惯可以推广到所有工程改动：docker run、compose up、流水线跑一遍，成本很低，收益是让你在"成功"这两个字面前保持基本的怀疑。</p>
+        </div>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 04 章讲资源限制和重启策略时，我们是从"运行时怎么给容器划边界"的角度看的。本章第八节讲基础镜像选择时，其实是在更早的一步做同一件事：镜像里有什么，决定了运行时你能给它划出多小的攻击面。distroless 之所以安全，不是因为它运行时做了什么特别的设置，而是因为它里面压根没有那些常年爆漏洞的工具。<strong>"少即是安全"这条思路，在容器世界里从镜像构建就开始了</strong>，第 09 章会把这条线索从镜像一路接到运行时的权限配置上。</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>distroless 镜像里没有 shell，所以攻击者拿到执行权限后也没有顺手可用的工具，这被视为安全优势。但同时，你自己的运维也失去了这些工具。请设计一个折中方案，让"生产镜像很干净"和"出故障时我能进去看看"这两个需求同时被满足。
+              <span class="sub">提示：想一想"临时容器"这个概念，以及调试用的工具是否一定要在主镜像里。</span>
+            </li>
+            <li>假设你在一家很小的团队里，只有你在写 Dockerfile，项目体积从 800 MB 优化到 90 MB，但构建时间从 40 秒变成 3 分钟。你会怎么向队友解释这个决定？如果队友说"我们又不缺硬盘"，你会怎么回答——或者你会同意他吗？
+              <span class="sub">提示：把"镜像体积"换算成具体的成本：拉取时间、CI 计费、部署窗口、磁盘配额，哪一个在你们团队里是真的稀缺资源。</span>
+            </li>
+          </ol>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 12 章会从"单机容器"跨到"集群"。在集群里，镜像体积这件事会发生质变：一台机器上可能跑几十个 Pod，每次扩容都要在几秒内把镜像准备好，如果镜像有 2 GB，扩容速度就成了瓶颈，而节点磁盘也会被镜像缓存塞满。到那时你会重新理解为什么"镜像瘦身"不是审美问题。同时，你在本章学的多阶段构建、标签规范、基础镜像选择，都会直接变成 Kubernetes 部署文件里的 image 字段和你维护的基础镜像仓库。</p>
+        </div>
+
+        <h2 id="s9">把这一章装进一个真实项目</h2>
+        <p>前面八节是拆开讲的，现在我们把它们组装起来。这一节给你一个可以照着做的完整流程：从项目的朴素 Dockerfile 出发，一步步改造成一份你自己能解释清楚每一行的版本。请你真的动手做完这六步，它会把你读到的所有知识变成手上的经验。</p>
+
+        <h3 id="s9-1">实验一：建立朴素基线并记录数据</h3>
+        <p><strong>实验目的</strong>：先量一次，后面所有优化才有参照。很多人优化了半天却说不清收益，是因为从来没测过起点。</p>
+
+        <pre data-lang="bash"><code>mkdir -p ~/docker-lab/ch05/frontend
+cd ~/docker-lab/ch05/frontend
+cat &gt; index.html &lt;&lt;'EOF'
+&lt;!DOCTYPE html&gt;
+&lt;html lang="zh-CN"&gt;&lt;head&gt;&lt;meta charset="UTF-8"&gt;&lt;title&gt;ch05&lt;/title&gt;&lt;/head&gt;
+&lt;body&gt;&lt;h1&gt;hello from a tiny image&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;
+EOF
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM nginx:1.27
+COPY . /usr/share/nginx/html
+EOF
+docker build -t naive:1 .
+docker images naive:1
+docker image inspect naive:1 --format "{{.Size}}"</code></pre>
+        <p class="cmd-note">这是最朴素的写法，也是很多人的第一个 Dockerfile。docker images 会显示一个 200 MB 左右的数字——因为它基于 nginx:1.27，而那个完整镜像里带着整套 Debian 环境和一堆你不会用到的模块。docker image inspect 的 --format 只打印字节数大小，方便你把它记到笔记里。请现在就把这两个数字写下来：一个是你眼睛看到的体积，一个是你准备用来比较的精确字节数。</p>
+        <p>预期现象：镜像能跑，docker run -d -p 8080:80 naive:1 之后浏览器访问 localhost:8080 能看到那句话。要你解释的问题：这个镜像里 200 MB 中，属于你的内容有多少？剩下的东西是谁放进去的，它们是"必需"的吗？<strong>变体追问</strong>：把 FROM 换成 nginx:1.27-alpine 再构建一次，体积变成多少？这次替换有什么风险你无法通过"能打开网页"来验证？</p>
+
+        <h3 id="s9-2">实验二：换成多阶段构建并测出前后对比</h3>
+        <p><strong>实验目的</strong>：亲手得到一次"一个数量级"的对比数字，同时也看清多阶段构建的适用边界。</p>
+
+        <pre data-lang="bash"><code>cd ~/docker-lab/ch05
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM node:20 AS build
+WORKDIR /build
+COPY app/package.json app/package-lock.json ./
+RUN npm ci
+COPY app/ .
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=build /build/dist /usr/share/nginx/html
+EXPOSE 80
+EOF
+docker build -t frontend:multi .
+docker images</code></pre>
+        <p class="cmd-note">如果你手边没有真实的前端项目，可以先用一个"假装要构建"的极简例子：让 build 阶段只做 RUN mkdir -p /build/dist 并写一个 index.html 进去，运行时阶段照旧 COPY --from=build。重点不是前端构建本身，而是让你观察 docker images 里两个标签的体积差。用一个真实存在的项目效果最好，因为只有真实依赖才能让你感受到"构建期依赖有多厚"。</p>
+        <p>预期现象：frontend:multi 的体积与 nginx:1.27-alpine 接近，通常落在几十 MB。要你解释的问题：node 那 1.1 GB 的层去哪了？它们还算不算占你的磁盘？用 docker system df 看一下"构建缓存"那一行的数字，你就得到答案了。<strong>变体追问</strong>：如果你把 build 阶段的 FROM 换成 node:20-alpine，最终镜像会变小吗？请先说结论再验证——这个问题的答案会让很多人意外。</p>
+
+        <h3 id="s9-3">实验三：观察缓存命中与失效</h3>
+        <p><strong>实验目的</strong>：把第六节的抽象机制变成你自己看到的输出。第六节已经给了命令，这里补上完整的观察清单。</p>
+
+        <pre data-lang="bash"><code>cd ~/docker-lab/ch05/frontend
+docker build --progress=plain -t naive:2 . 2&gt;&amp;1 | Select-String "CACHED"
+echo "&lt;!-- t $(Get-Date -Format o) --&gt;" &gt;&gt; index.html
+docker build --progress=plain -t naive:2 . 2&gt;&amp;1 | Select-String "CACHED"</code></pre>
+        <p class="cmd-note">第一次构建时没有任何 CACHED 行（或者只有基础镜像相关的一行）。改完 index.html 再构建，你会看到 COPY 那一层重建了，而基础镜像那一步仍然 CACHED——这就把"缓存是链式的、断点之后才重建"这件事展示出来了。</p>
+        <p>要你解释的问题：如果你把 Dockerfile 改成 COPY index.html /usr/share/nginx/html 这种精确复制（而不是 COPY . ），那么以后再往目录里加一个 style.css 文件时，缓存会失效吗？会失效几次？<strong>变体追问</strong>：如果项目目录里有一个 300 MB 的数据文件，但它不在 .dockerignore 里，也不被任何 COPY 指令引用，它会影响构建速度吗？请先回答再看 transferring context 那行输出。</p>
+
+        <h3 id="s9-4">实验四：让 node_modules 进镜像，然后再修好</h3>
+        <p><strong>实验目的</strong>：把"上下文"和"镜像内容"这两个容易混为一谈的概念分开。</p>
+
+        <pre data-lang="bash"><code>cd ~/docker-lab/ch05
+docker build --progress=plain -t ctx:before . 2&gt;&amp;1 | Select-String "transferring"
+ls app | Select-Object -First 20
+cat &gt; .dockerignore &lt;&lt;'EOF'
+.git
+node_modules
+dist
+*.log
+.env
+EOF
+docker build --progress=plain -t ctx:after . 2&gt;&amp;1 | Select-String "transferring"</code></pre>
+        <p class="cmd-note">如果你的 app 目录里已经装过依赖，第一次构建会在 transferring context 这一步明显变慢，上下文体积可能是几百 MB；加上 .dockerignore 之后，同一行快得多。这里有一个非常容易被忽略的细节：你的 Dockerfile 里可能已经写了忽略 node_modules 的 COPY 逻辑（比如先 COPY package.json 再 npm ci），所以镜像里本来就没有 node_modules——但上下文仍然把它传过去了。<strong>镜像大小和上下文大小是两个独立的量</strong>，.dockerignore 管的是后者，很多人一直没有分清这一点。</p>
+        <p>要你解释的问题：为什么"镜像里没有 node_modules"和"上下文里不该有 node_modules"是两条不同的要求？分别用哪一个机制来保证？<strong>变体追问</strong>：如果 .dockerignore 里写了 node_modules，但你的 Dockerfile 里真的想 COPY node_modules（比如你已经在本机构建好了、只想复制进去），会发生什么？请动手试一次，观察报错信息。</p>
+
+        <h3 id="s9-5">实验五：验证 ENV 生效与 ARG 泄漏</h3>
+        <p><strong>实验目的</strong>：把"哪个值去了哪里"这件事变成可观察的事实。</p>
+
+        <pre data-lang="bash"><code>cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.20
+ARG BUILD_NOTE=this-should-not-be-runtime-visible
+ENV RUNTIME_NOTE=this-is-runtime-visible
+RUN echo "build step running"
+CMD ["env"]
+EOF
+docker build -t envarg:1 .
+docker run --rm envarg:1
+docker history --no-trunc envarg:1</code></pre>
+        <p class="cmd-note">docker run --rm envarg:1 直接执行 CMD 里的 env，把容器里所有的环境变量打出来——你会看到 RUNTIME_NOTE，因为 ENV 是运行期配置。docker history 里你会看到 ARG BUILD_NOTE=this-should-not-be-runtime-visible 那行文本，而它并没有出现在 env 的输出里。两个命令一起用，你就同时证明了"ENV 影响运行期"和"ARG 泄漏进历史但不进运行环境"。</p>
+        <p>要你解释的问题：ARG 的值既然不在运行环境里，为什么"泄漏"还是一个问题？它泄漏给了谁？<strong>变体追问</strong>：如果改成 ARG BUILD_NOTE 然后在后面写 ENV BUILD_NOTE=$BUILD_NOTE，情况会怎样变化？请在动手做之前先预测，然后验证。</p>
+
+        <div class="ornament">层 与 顺 序</div>
+
+        <p>五个实验做完，你手上应该有一份属于自己的数据表：朴素镜像的体积、多阶段后的体积、构建耗时的前后对比、缓存命中的行数变化。<strong>这份数据表比本章任何一句话都更有价值</strong>，因为它是你在自己机器上量出来的，是你以后做技术判断时可以引用的证据。我在这一章里给你的所有数字都只是参考量级，只有你自己测过的数字才是你的。</p>
+        <!-- ===================== 章末 ===================== -->
+        <h2 id="selfcheck">自测：检验你是否真的学懂了</h2>
+        <p>下面十二道题混合了概念辨析、现象解释、命令预测、故障诊断和方案取舍。请先合上本章自己写答案，再展开对照。评分要点是思路，不是措辞——如果你的答案方向对了但细节含糊，说明那一块还需要回去重读。</p>
+        <div class="block check">
+          <span class="bt">检 查 题</span>
+          <ol>
+            <li>请用一句话向同学解释 Dockerfile 与"我 ssh 上去装一遍"的本质差别，并指出手工步骤的哪三个性质让它无法被信任。
+              <details><summary>参考答案</summary><p>本质差别是"声明"与"动作"的差别：Dockerfile 描述我要求最终状态是什么，手工步骤记录我曾经做过什么。三个性质分别是不可评审（别人无法在发生前发现问题）、不可追溯（事后没人知道机器上装过什么）、不可复现（同一串步骤在不同时间执行结果可能不同）。只要答出"声明 vs 动作"并给出三条中的两条，就算过关；能把三条都落到具体场景（比如"半年后重装服务器"）更好。</p></details>
+            </li>
+            <li>下面四条指令里，哪几条会产生新的镜像层？FROM、RUN、COPY、ENV、WORKDIR、LABEL。并说明判断依据。
+              <details><summary>参考答案</summary><p>会产生层的是 RUN 和 COPY。判断依据是"它是否改变了文件系统"：只有改变文件系统的指令才需要用一层来记录变化。FROM 不产生新层，它把你指定的基础镜像的层直接接过来当起点；ENV、WORKDIR、LABEL 只修改镜像的配置元数据，改的是一份 JSON 而不是文件内容。能答出"改文件系统才产生层"这个口径，比记住具体名单更重要。</p></details>
+            </li>
+            <li>你的 Dockerfile 里有这两行：
+              <pre data-lang="bash"><code>RUN apt-get update
+RUN apt-get install -y curl</code></pre>
+              构建成功过很多次，某天突然报 404 找不到包。请解释原因，并给出正确的写法。
+              <details><summary>参考答案</summary><p>因为 RUN 的缓存键只包含父层和指令文本，不包含执行结果。第一条 RUN 的文本从未变化，所以构建引擎一直复用它很久以前留下的包索引，而远程仓库里的包早已更新或迁移，导致索引与实际内容不匹配。正确写法是合成一层：RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends curl &amp;&amp; rm -rf /var/lib/apt/lists/*。这样索引与安装成为同一个缓存单位，要么一起新、要么一起重建。评分要点：必须点出"缓存不感知执行结果"这个机制，只背正确写法不给分。</p></details>
+            </li>
+            <li>某镜像的 Dockerfile 里只写了 CMD ["python", "app.py"]。请分别预测这三条命令会执行什么：
+              <pre data-lang="bash"><code>docker run img
+docker run img other.py
+docker run --entrypoint bash img</code></pre>
+              <details><summary>参考答案</summary><p>第一条执行 python app.py。第二条执行 other.py——注意是"整个 CMD 被替换"，不是追加，所以 python 都不见了，这也是很多人第一次看到结果时最吃惊的地方。第三条会进入 bash，因为 --entrypoint 覆盖了入口，而原本没有 ENTRYPOINT，此时 CMD ["python","app.py"] 会被当成参数追加给 bash，所以实际等价于执行 bash python app.py，也就是 bash 尝试把 python 当成脚本文件去读。评分要点：第二条必须答对"被替换"而不是"追加"，第三条能意识到 CMD 依然存在并被追加就很好。</p></details>
+            </li>
+            <li>一个镜像用 ENTRYPOINT python /sig.py 这种 shell 形式启动。请说出至少两个可观察到的后果，以及各自的原因。
+              <details><summary>参考答案</summary><p>后果一：docker stop 要等满 10 秒才返回，因为 SIGTERM 发给了 PID 1，而 PID 1 是 /bin/sh 而不是 python，sh 未必把信号转发给子进程，于是超时后只能 SIGKILL 硬杀。后果二：docker run img -it bash 之类的追加参数无效，因为 /bin/sh -c 只拿到一条固定命令文本，你在后面写的东西被当成它的参数而不被使用。还有第三个可以加分的答案：容器里可能出现僵尸进程，因为真正回收子进程的责任落到了那个 sh 身上。评分要点：现象与原因要配对，只说"信号收不到"而不说"因为多了一层 sh 当 PID 1"是不完整的。</p></details>
+            </li>
+            <li>你在项目根目录执行 docker build -t x .，但项目里有一个 2 GB 的数据集目录。构建还没开始就跑得很慢。请解释发生了什么，并给出两种改善手段，说明它们的区别。
+              <details><summary>参考答案</summary><p>因为在执行任何指令之前，构建引擎要先把整个上下文（当前目录）打包发送到构建引擎那边，2 GB 数据集也被卷进去了，所以卡在 transferring context。改善手段一：写 .dockerignore 把数据集目录排除，这样它不进上下文。改善手段二：改变构建的发起位置，把 docker build 的上下文参数缩小到只包含需要的目录，或者调整项目布局，让 Dockerfile 和源码在一个更小的子目录里，用 -f 指定 Dockerfile 路径而在那个子目录里执行构建。区别在于：.dockerignore 是"在同一个上下文里排除某些文件"，调整上下文范围是"根本不把那些文件纳入上下文"。评分要点：必须区分上下文大小与镜像大小这两个独立的量。</p></details>
+            </li>
+            <li>判断对错并说明理由：EXPOSE 8000 之后，你的浏览器就能通过宿主机的 8000 端口访问到服务了。
+              <details><summary>参考答案</summary><p>错。EXPOSE 只是镜像里的一个声明，它不发布任何端口。容器有自己的网络命名空间，宿主机的端口与容器里的端口是隔开的，要打通必须用 docker run -p 8000:8000（或 compose 里的 ports）。EXPOSE 的价值在三处：作为文档告诉使用者该映射哪个端口、让 docker run -P 能自动随机映射、把服务的接口信息写进交付物。评分要点：能说出"它什么都不做但它有价值"这个看似矛盾的点，说明理解到位了。</p></details>
+            </li>
+            <li>某个 RUN 指令在构建时下载了 200 MB 的依赖包，构建成功。你的同事说"在下面加一行 RUN rm -rf /tmp/pkgs 就能把镜像变小"。请评价这个说法。
+              <details><summary>参考答案</summary><p>这个说法是错的。层是不可变的，删除动作只会在新的一层里写一个"遮蔽标记"，被删的文件仍然存在于它原来那一层里，所以镜像体积不变（甚至还多一点元数据）。正确做法有三条路：把下载与删除写在同一个 RUN 里，让它们属于同一层（这样这一层里就没有残留文件）；用多阶段构建，把下载和编译放在中间阶段，最终阶段只复制产物；或者用 BuildKit 的缓存挂载把这些内容放在层之外。评分要点：必须点出"层不可变 + 白障标记"这个机制，只说"要多阶段"不算讲透。</p></details>
+            </li>
+            <li>你的 Dockerfile 里写了 ARG DB_PASSWORD=某个真口令，并且从来没有把它写成 ENV，也没有 echo 出来。这个口令安全吗？请说明它可能出现在哪些地方。
+              <details><summary>参考答案</summary><p>不安全。ARG 的值会被写进镜像的构建历史元数据，任何人拿到这个镜像后执行 docker history --no-trunc 就能看到完整的 ARG 指令文本，包括口令。此外它还可能出现在构建日志里、出现在 CI 的日志留存里。正确做法是用 BuildKit 的构建期密钥注入：RUN --mount=type=secret,id=xxx,target=/某路径，构建时用 docker build --secret id=xxx,src=本地文件 提供，密钥只在构建那一瞬间以文件形式存在，不进任何层。验证方法：构建后跑 docker history --no-trunc 和 docker run --rm 镜像 env，两处都找不到它。评分要点：必须提到构建历史这个泄漏渠道。</p></details>
+            </li>
+            <li>下面两份 Dockerfile 功能完全一样，请指出哪一份的日常开发体验更好，并说明你在第二次构建时会看到什么不同的输出：
+              <pre data-lang="bash"><code><span class="cmt"># 甲</span>
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+
+<span class="cmt"># 乙</span>
+COPY . .
+RUN npm ci</code></pre>
+              <details><summary>参考答案</summary><p>甲更好。改动源码后重新构建时，甲的输出里依赖安装那一步仍然是 CACHED（因为它的输入只有两个清单文件，没有被改动），只有最后的 COPY . . 重建；乙的输出里 COPY . . 失效，紧接着的 RUN npm ci 也失效，整棵依赖树重新下载安装。前提假设是 .dockerignore 排除了 node_modules，否则乙的 npm ci 会因为已经存在 node_modules 而行为怪异。评分要点：一定要讲出"缓存是链式的，一层断则后面全断"这个机制，并给出具体的 CACHED 观察点。</p></details>
+            </li>
+            <li>诊断题：一个用多阶段构建的镜像很小，只有 60 MB，但 docker run 起来立刻退出，退出码是 0，日志里什么都没有。你会按什么顺序排查？至少给出三个不同的可能原因。
+              <details><summary>参考答案</summary><p>排查顺序建议从"它到底执行了什么"开始，而不是从镜像内容开始。第一步用 docker inspect -f "{{.Config.Entrypoint}} --- {{.Config.Cmd}}" 看入口配置是否为空或被覆盖成了别的东西；第二步用 docker run --rm --entrypoint sh 镜像（如果还有 shell）进去看目录结构，确认 COPY --from 的目标路径是不是真的存在产物；第三步检查是不是 COPY --from 复制到了一个空目录——这不会报错，只会给你一个空目录和一个成功构建，是这类问题最常见的原因。其他的可能原因还有：CMD 被写成了 shell 形式但命令不存在；入口脚本缺少可执行权限；程序找不到配置文件而它选择静默退出。评分要点：能想到"跨阶段 COPY 到空目录不会报错"这一条说明你理解了多阶段的脆弱点。</p></details>
+            </li>
+            <li>方案取舍题：你的团队要为一个内部服务选基础镜像，候选是 ubuntu:24.04、debian:12-slim、alpine、distroless。请给出你的选择和理由，并说明在什么条件下你会改选另一个。
+              <details><summary>参考答案</summary><p>比较稳妥的默认选择是 debian:12-slim（或官方语言镜像的 slim 变体）：glibc 兼容性完整，体积比 ubuntu 小，常见的 apt 包都能装，出现"某个依赖装不上"的概率最低。如果镜像要被高频拉取部署、且依赖已经验证过在 musl 下没问题，可以改选 alpine 换取几倍的体积下降。如果安全合规要求高、服务部署后基本不再改动、团队有接受"排障更难"的心理准备，可以选 distroless。ubuntu 则在需要较新的系统库或团队已有大量基于它的脚本时更合适。评分要点：必须有"什么条件下改选"这一半，只说选择不说条件最多给一半分；能提到"Alpine 上预编译二进制 Wheel 会退回源码编译而失败"这个具体风险是加分项。</p></details>
+            </li>
+          </ol>
+        </div>
+
+        <h2 id="ask">自问自答：把知识压进长期记忆</h2>
+        <div class="block think">
+          <span class="bt">自 问 自 答</span>
+          <p>下面这些问题没有参考答案，因为答案应该在你脑子里。请合上页面，用自己的话把它们讲一遍——讲给自己听，或者讲给你室友听。讲不顺的地方就是还没学透的地方。</p>
+          <ol>
+            <li>不用任何术语，向一个没写过 Dockerfile 的人解释"为什么指令顺序会影响构建速度"。</li>
+            <li>把本章的指令按"是否产生层"分成两堆，然后解释这个分法为什么能解释"镜像太大"这类问题。</li>
+            <li>CMD 与 ENTRYPOINT 的区别，你会用哪一句话概括？这句话能解释第四节那张表里的每一行吗？</li>
+            <li>为什么 shell 形式会带来信号问题？请从"谁是 PID 1"这个角度讲清楚。</li>
+            <li>构建上下文与镜像内容是什么关系？为什么它们的大小是两个独立的量？</li>
+            <li>缓存的键由哪几样东西组成？为什么 RUN 的结果不在里面，而 COPY 的文件内容在里面？</li>
+            <li>多阶段构建省下了什么，又付出了什么？请分别从"镜像体积""构建时间""调试难度"三个角度各说一句。</li>
+            <li>Alpine 更小，为什么很多官方镜像的默认标签仍然是 Debian？把理由讲成一个具体的故事。</li>
+            <li>如果只允许你在本章的减重清单里保留三条，你会保留哪三条？为什么是这三条而不是别的？</li>
+            <li>这一章里你觉得自己最没把握的是哪一处？你打算怎么验证它——想看哪份文档、想做哪个实验、想对比哪两个输出？</li>
+          </ol>
+        </div>
+
+        <h2 id="summary">本章总结</h2>
+        <ul>
+          <li>Dockerfile 是把手工步骤改写成可版本化、可评审、可复现文本的手段。它属于基础设施即代码这个思想家族，核心收益不是省事，而是别人能复现你的结果。手工步骤的三个致命性质是不可评审、不可追溯、不可复现。</li>
+          <li>一份 Dockerfile 的逻辑骨架是四段：定地基（FROM）、装依赖（RUN 与依赖清单）、拷代码（COPY）、定启动（WORKDIR、ENV、USER、EXPOSE、HEALTHCHECK、CMD、ENTRYPOINT）。这四段的顺序本质上是"变化频率的降序排列"。</li>
+          <li>只有改变文件系统的指令才产生层，也就是 RUN、COPY、ADD；FROM 是承接已有层，其余指令只修改配置元数据。所以"镜像太大"这件事只可能来自 FROM 与那三条指令。</li>
+          <li>RUN 的缓存键只包含父层与指令文本，不包含执行结果，这是 apt-get update 必须与 install 写在同一层的原因，也是"缓存会骗你"的根源。</li>
+          <li>COPY 只能从构建上下文里取文件，因为上下文是构建引擎能看到的整个世界。上下文会被整包发送给引擎，所以 .dockerignore 是每个项目的必备文件，它管的是上下文大小，与镜像大小是两个独立的量。</li>
+          <li>ENTRYPOINT 是"这个镜像是哪个可执行文件"，CMD 是"默认参数"。docker run 末尾的参数会替换整个 CMD，但会追加给 ENTRYPOINT。想要接口坚固就用 ENTRYPOINT 加 CMD，想要使用自由就只用 CMD。</li>
+          <li>exec 形式（JSON 数组）不经过 shell，进程直接是 PID 1，信号能送达，变量不展开；shell 形式会包一层 /bin/sh -c，导致信号难以转发、变量由 shell 展开、shell 承担 PID 1 的回收责任。所以服务镜像应当优先用 exec 形式。</li>
+          <li>构建缓存是链式的：一条指令的输入变化会让它和它之后的所有指令失效。因此"先装依赖、后拷代码"是本章最值得立刻应用的一条实践，它能把日常构建从几分钟压到几秒。</li>
+          <li>多阶段构建把"构建需要的工具"和"运行需要的环境"分开，让最终镜像只保留后者，常见收益是一个数量级的体积下降。它的代价是 Dockerfile 变复杂、构建时间可能变长、中间阶段默认不可调试——用 docker build --target 阶段名 可以缓解最后一条。</li>
+          <li>BuildKit 提供了三项值得知道的能力：--mount=type=cache 让包管理器的下载缓存跨构建保留；--mount=type=secret 让密钥在构建期路过而不进层；--platform 与构建元数据支持多平台与供应链可追溯。</li>
+          <li>基础镜像的选择是体积、兼容性、调试便利、攻击面四者的权衡。Alpine 小但 musl 兼容性有代价，distroless 安全但难调试，scratch 只适合静态编译。稳妥的默认值是官方镜像的 slim 变体。</li>
+          <li><strong>这一章最重要的一个判断是：写 Dockerfile 不是背语法，而是做取舍。</strong>每一条指令都在体积、构建速度、缓存有效性、可读性、安全之间移动砝码；一份好的 Dockerfile 不是最省的，而是让你在三个月后仍然读得懂、改得动的。优化的目标不是最小，而是在你能维护的复杂度里刚好够好。</li>
+        </ul>
+        <p>回头看本章开头那个场景：你在微信上给同学发三条语音说"你要先装 gcc，注意那个 numpy 版本"。写下这一章之后，那句话可以换成一行 git push 加一个仓库地址。技术给人最大的礼物，是让你不必再依赖别人的记忆和自己的运气。Dockerfile 就是这么一份不声不响的礼物——它看起来只是一堆大写字母开头的指令，但它把"我曾经能跑"变成了"任何人都能跑"。</p>
+        <p>我们已经会造箱子了：知道该往里面放什么、放在哪一层、以什么身份运行、启动时执行什么。但箱子里最要紧的东西还没有地方安放——那些不能被重新制作、不能被重新下载、丢了就真丢了的东西。下一章讲数据与卷，我们会把一个朴素却容易被忽略的事实讲透：容器可以被视为随时会消失的东西，数据不可以。</p>
+
+        <h2 id="more">拓展：如果你想让这一章长得更深</h2>
+        <div class="block method">
+          <span class="bt">拓 展 阅 读</span>
+          <ul class="res-list">
+            <li>
+              <span class="rt">Dockerfile 参考手册<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/reference/dockerfile/" target="_blank" rel="noopener">https://docs.docker.com/reference/dockerfile/</a>
+              <span class="rd">这是每一条指令的权威定义，也是你唯一应该在语法上相信的地方。不要从头读到尾，而是"带着问题查"：你写了一条指令不确定它的参数、或者不确定它是否会产生层时，来查这一页。读的时候重点看每条指令下的 Notes 段落，那里写着大量只有踩过坑的人才会写出来的边界情况，比如 COPY 的目标路径是目录还是文件、ARG 的作用域规则。有一个值得专门去查的问题：ARG 在 FROM 之前声明和在 FROM 之后声明，作用范围有什么差别？这一处细节在本章没有展开，你能自己查明白它，就说明你已经具备独立读官方文档的能力了。</span>
+            </li>
+            <li>
+              <span class="rt">构建最佳实践<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/build/building/best-practices/" target="_blank" rel="noopener">https://docs.docker.com/build/building/best-practices/</a>
+              <span class="rd">这一页是本章第七、八两节的官方版本，几乎每一条都能在本章找到对应的解释。建议你读完本章之后再来读它，然后做一件更有价值的事：拿一份你自己写过的 Dockerfile，逐条对照这一页，把不符合的地方列成一张清单，再一条条判断"我为什么没这么做、我需要改吗"。带着问题去读，比如"官方为什么明确反对用 ONBUILD""为什么建议一个容器只跑一个进程"。这份清单会比你读十篇博客都有用。</span>
+            </li>
+            <li>
+              <span class="rt">多阶段构建<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/build/building/multi-stage/" target="_blank" rel="noopener">https://docs.docker.com/build/building/multi-stage/</a>
+              <span class="rd">重点读里面"命名阶段""只构建到某个阶段""把构建产物直接输出到本地目录"这三部分。本章讲了思路和取舍，这一页给你完整的语法组合。带着这个问题去读：如果我的构建需要三个阶段（装依赖、编译、运行），阶段之间的文件该怎么走才不会重复传输？这一页的示例会给你一个干净的范式。</span>
+            </li>
+            <li>
+              <span class="rt">构建缓存<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/build/cache/" target="_blank" rel="noopener">https://docs.docker.com/build/cache/</a>
+              <span class="rd">本章第六节讲的是缓存的心智模型，这一页讲的是缓存的具体操作：怎么查看缓存占用、怎么清理、怎么把缓存导出到一个镜像里、怎么在 CI 里导入它。读它的时候请聚焦"缓存失效"的那几段，特别是关于 COPY 与 ADD 的哈希计算方式——那里有一个你会想验证的细节：文件的时间戳会不会影响缓存？(答案是元数据里只有内容与权限参与计算，但请你亲自验证一次，这个动作本身就是本章第四节方法论的一个练习。)</span>
+            </li>
+            <li>
+              <span class="rt">构建上下文<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/build/building/context/" target="_blank" rel="noopener">https://docs.docker.com/build/building/context/</a>
+              <span class="rd">这一页把"上下文"这个概念讲得比本章更细：除了目录上下文，还有从标准输入读入 Dockerfile、从 Git 仓库地址直接构建这几种形态。带着这个问题去读：如果我把上下文从 Git 地址给出去，.dockerignore 还有效吗？答案会拓展你对"上下文"这个词边界的理解，也会让你明白为什么 CI 里有时会用那种看起来很奇怪的构建命令。</span>
+            </li>
+          </ul>
+        </div>
+        <div class="block method">
+          <span class="bt">值 得 品 读 的 书</span>
+          <ul class="booklist">
+            <li>
+              <span class="bn">《Docker 实践》</span> <span class="ba">Ian Miell、Aidan Hobson Sayers 著</span>
+              <span class="bw">这本书的特点是"技巧密集"，里面有大量真实场景下的 Dockerfile 手法与陷阱，正好补上本章为了讲原理而省略的那些工程细节。适合在你已经能独立写出 Dockerfile 之后读，最好边读边打开自己的项目对照试验。带着这三个问题读：书里哪些技巧是在解决我已经遇到过的问题？哪些是在解决我还没遇到但迟早会遇到的问题？有没有哪一条与本章的结论冲突，我能不能设计一个实验来判断谁对？</span>
+            </li>
+            <li>
+              <span class="bn">《Docker 开发指南》</span> <span class="ba">Adrian Mouat 著</span>
+              <span class="bw">它偏工程流程，讲的是怎么把容器真正用进日常开发：镜像构建如何嵌进工作流、开发环境与生产环境如何共用一份构建定义、测试怎么跑。这一章你学了"怎么写一份好 Dockerfile"，这本书补上"这份 Dockerfile 在团队里怎么活下去"。适合在你开始和别人协作、或者开始写课程设计以外的项目时读。带着这个问题读：我的构建方式会不会让队友每次改代码都要等很久？</span>
+            </li>
+            <li>
+              <span class="bn">《重构》</span> <span class="ba">Martin Fowler 著</span>
+              <span class="bw">看起来和 Docker 无关，但它训练的是本章最需要的一种意识：代码与环境定义都会腐化，需要持续的小步整理。你在本章学到的"调整指令顺序""合并 RUN""拆出公共基础镜像"，其实都是重构手法在镜像定义上的投影。适合在你写过十几个 Dockerfile、开始感到"每次都在重复同样的结构"的时候读。带着这个问题读：什么样的重复是应该被消除的，什么样的重复其实是在保护可读性？</span>
+            </li>
+          </ul>
+        </div>
+
+        <nav class="chnav" id="chnav"></nav>
+      </article>
+
+      <footer class="footer">
+        <p><b>深海与木箱 · Docker 深度学习手册</b>　第 05 章</p>
+        <p><a href="../index.html">← 返回总览与地图</a>　·　<a href="../glossary.html">术语总表</a></p>
+      </footer>
+    </div>
+  </main>
+</div>
+
+<script src="../data/terms.data.js"></script>
+<script src="../data/chapters.data.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

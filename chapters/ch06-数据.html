@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 06 章 · 数据：让重要的东西活过容器的死亡 · 深海与木箱</title>
+<meta name="description" content="可写层的真相、数据卷与绑定挂载与 tmpfs 的取舍、-v 与 --mount 的陷阱、空卷初始化、匿名卷黑洞、Windows 挂载体验、备份恢复演练、数据库容器化与数据生命周期设计。">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="ch06">
+
+<header class="topbar" id="topbar"></header>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="main">
+    <div class="wrap">
+      <article class="article" id="article">
+
+        <!-- ===================== 章首 ===================== -->
+        <div class="ch-eyebrow"><span class="num">第 06 章</span><span>可 写 层 之 外 · STORAGE &amp; DATA</span></div>
+        <h1>数据：让重要的东西活过容器的死亡</h1>
+        <p class="ch-tagline">容器可以被视为随时会消失的东西，数据不可以。</p>
+
+        <div class="block goal">
+          <span class="bt">本 章 学 习 目 标</span>
+          <ul>
+            <li>能解释"容器里能写文件"与"数据安全"为什么是两件毫不相干的事，并指出可写层在什么时刻必然消失。</li>
+            <li>能从机制上说明写放大的来源，判断哪一类写操作会慢一个数量级，而不只是背下"数据库别放可写层"这句结论。</li>
+            <li>理解数据卷、绑定挂载、tmpfs 三者的本质差异在于"谁拥有这块存储、它挂在生命周期的哪一段上"，并能在具体项目里给出取舍理由。</li>
+            <li>能解释空卷初始化语义为什么存在，并据此预测"我改了镜像里的配置，容器里为什么没变"。</li>
+            <li>能说清 Docker Desktop 在 Windows 上制造的那条虚拟机边界，对文件性能与文件变更通知各意味着什么。</li>
+            <li>理解"备份成功"与"恢复成功"是两个独立命题，并知道用什么动作把前者变成后者。</li>
+            <li>掌握数据生命周期三分法，能对一个真实项目里的每一份数据做出"放哪里、备不备、留多久"的判断。</li>
+          </ul>
+        </div>
+
+        <div class="block skill">
+          <span class="bt">学 完 之 后 ， 你 应 该 能 够</span>
+          <ul>
+            <li>能写出：为任意一个容器正确挂载数据卷、绑定挂载与 tmpfs 的完整命令，并说明每个参数的作用。</li>
+            <li>能判断：一条 `-v` 命令到底会创建卷还是会创建绑定挂载，以及它在 Windows 上会不会静默生成一个你不想看到的目录。</li>
+            <li>能排查：容器重启后数据消失、改了镜像但容器行为没变、磁盘被占满却找不到大文件这三类故障。</li>
+            <li>能设计：为一个带数据库的项目规划数据分类方案，写出每类数据的存放位置与保留策略。</li>
+            <li>能验证：独立完成一次"导出 tar → 删除原卷 → 从 tar 恢复 → 校验数据"的完整演练，并给出可复现的命令流程。</li>
+            <li>能解释：把项目放到 WSL 文件系统与放在 Windows 盘符上，为什么前端热更新一个能用一个不能用。</li>
+            <li>能取舍：面对"开发用绑定挂载、生产用数据卷"这条准则，说出它在什么条件下应该被推翻。</li>
+          </ul>
+        </div>
+
+        <p class="ch-lead">上一章你把一堆手工步骤写进了 Dockerfile，学会了把环境固化成不可变的层，还用多阶段构建把镜像从几百 MB 压到几十 MB——你当时应该已经感觉到一种安全感：镜像里的一切都被记录、被复现、被版本控制。但那份安全感只覆盖了代码与依赖。容器跑起来之后产生的那些东西——用户上传的文件、数据库写入的行、日志、模型权重、缓存——没有一样在 Dockerfile 里，它们全部落在了一个你这几章从未仔细看过的地方：可写层。而可写层有一个残酷的性质：它和容器的命绑在一起。你在 Dockerfile 里写过的 `VOLUME` 指令当时只用了一句话带过，本章要把那句话拆开，看看它背后是一整套关于"数据该住在哪"的设计。这一章要回答的核心问题是：当容器这种东西被设计成随时可以删除、随时可以重建时，那些不能被删除、不能被重建的东西，应该放在哪里？</p>
+
+        <!-- ===================== 正文 ===================== -->
+        <h2 id="s1">可写层：一个看起来很能装、其实随时清零的地方</h2>
+
+        <p>先做一个你马上就能做的实验。启动一个容器，在里面写一个文件，然后删掉容器再开一个，看看文件还在不在。</p>
+
+        <pre data-lang="bash"><code>docker run --name scratch1 alpine sh -c "echo hello-from-scratch1 > /data.txt; cat /data.txt"
+docker rm scratch1
+docker run --rm alpine ls -l /data.txt</code></pre>
+        <p class="cmd-note">第一条命令输出 <code>hello-from-scratch1</code>，说明文件确实写进去了，容器里也能读到。第二条命令把容器删掉。第三条命令会报 <code>ls: /data.txt: No such file or directory</code>，退出码非 0。这三步连起来只说明一件事：那个文件从出生到消失，只活了三十秒，而它消失的原因不是有人删它，而是承载它的容器被删了。</p>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 03 章讲过镜像的层结构与写时复制（Copy-on-Write，CoW）：镜像由若干只读层叠成，容器启动时在只读层之上再加一层薄薄的可写层，两者通过联合文件系统（UnionFS，最常见实现是 OverlayFS）合并成容器看到的根文件系统 rootfs。当时的重点在"层如何复用、构建缓存如何生效"。现在我们把镜头转向那一层可写层——它才是本章的主角，因为它决定了你的数据有没有明天。</p>
+        </div>
+
+        <p>把写文件这件事拆到系统调用层面，你会看到一条比你想象中更长的路。假设容器里运行的进程想修改 <code>/etc/nginx/nginx.conf</code>，而这个文件来自镜像的只读层：</p>
+
+        <p>第一步，进程调用 <code>open</code> 打开文件。这时候 OverlayFS 在合并视图里找到的是下层（镜像层）里的那一份，读取完全正常，不产生任何复制。第二步，进程开始写。就在这个瞬间，写时复制被触发：内核把整个 <code>nginx.conf</code> 从只读层<strong>完整复制</strong>到可写层，然后修改发生在副本上，原来的那一份纹丝不动。第三步，此后所有对这个路径的读写都落在可写层，只读层里的旧内容被"遮住"了，但它依然存在、依然占着空间。第四步，如果进程删除这个文件，OverlayFS 不会去动下层，而是在可写层放一个特殊的空白标记，业内叫白障（whiteout），它的作用就是"在下层那个文件上盖一块白布"。第五步，如果进程要改目录名或改权限，往往触发的是整个目录的复制——这被称为目录级写放大。</p>
+
+        <p>这五步里藏着一个反直觉的事实：<strong>容器里的写入从不修改镜像，它只是不断往上叠新东西。</strong> 镜像的那份 <code>nginx.conf</code> 永远是只读的、永远和你 build 出来的那一刻一模一样。你之所以感觉"改了"，是因为合并视图把上面那层优先展示了。</p>
+
+        <div class="block metaphor">
+          <span class="bt">比 喻</span>
+          <p>想象一本图书馆里谁都借不到的印刷书，它是只读层。你想在某一页上改一句话，管理员不允许你碰原书，于是给你一张透明胶片，让你把那一页完整抄一遍，然后在胶片上改；以后你看书时，胶片盖在书页上，你看到的是改过的版本。你每改一页就多一张胶片。删掉一个段落怎么做？在胶片上贴一张白纸，正好盖住那一段。现在关键问题来了：这些胶片放在哪里？答案是放在一个只属于你这次阅读的文件夹里，你一走，文件夹就被扔了。这就是可写层。</p>
+        </div>
+
+        <p>讲到这里，可以抛出本章第一个悬念。很多人第一次听说"容器无状态、数据要外置"时，会本能地反驳：容器明明能写文件啊，我 <code>docker exec</code> 进去用 vi 改了配置、装了软件、写了脚本，全都生效了，怎么会是"无状态"？这个反驳听起来很有道理，而它的错误恰恰是本章的分水岭。先别急着下结论，记住这个问题：<strong>如果一个东西可以被写，它是否就等于可以被依赖？</strong> 我们会在讲完写放大与生命周期之后回来把它彻底拆开。</p>
+
+        <h3 id="s1-1">写放大：为什么数据库的数据目录不能待在可写层</h3>
+
+        <p>写放大的字面意思是"你写了一个字节，磁盘上却动了远超一个字节"。在可写层里，它来自那个"先完整复制再修改"的动作。请你注意这里的动词是"完整"：不是复制你要改的那一行、那一个字节，而是复制整个文件。所以代价不由"你改了多少"决定，而由"你改的那个文件有多大"决定。</p>
+
+        <p>这个规律推出来的结论非常具体。改一个 2 KB 的配置文件，复制 2 KB，你根本察觉不到。改一个 8 GB 的数据库主数据文件，哪怕你只插入一行记录，内核也要先把 8 GB 复制一份——这一下就是数秒级甚至数十秒级的停顿，外加宿主机磁盘上凭空多出 8 GB 占用。数据库偏偏是那种"文件巨大、写入频繁、还要随机读写"的工作负载，它几乎是为暴露写放大缺点而生的。这就是为什么第 03 章说写时复制的代价在那里，也是为什么"数据库不适合跑在可写层"不是一句经验口诀，而是一条可以从机制推导出来的结论。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>典型写操作</th><th>可写层里的实际动作</th><th>性能感受</th><th>宿主机磁盘的额外占用</th></tr></thead>
+            <tbody>
+              <tr><td>改一个 1 KB 的配置文本</td><td>复制 1 KB 到可写层再改</td><td>无感</td><td>1 KB，可以忽略</td></tr>
+              <tr><td>追加写一个 500 MB 的日志文件</td><td>第一次写时复制整个 500 MB</td><td>首次写入卡顿明显</td><td>500 MB，且会随写入继续增长</td></tr>
+              <tr><td>数据库反复随机写 8 GB 数据文件</td><td>首次写入复制 8 GB；之后每次写都在可写层的新副本上</td><td>吞吐大幅下降、延迟毛刺</td><td>镜像体积 + 全部被改写内容，可能翻倍</td></tr>
+              <tr><td>删除镜像里一个 1 GB 的文件</td><td>只写一个白障标记，下层文件不动</td><td>瞬间完成</td><td>0，但空间也一字节都不会释放</td></tr>
+              <tr><td>把某目录当缓存反复写小文件</td><td>每个文件独立触发一次复制</td><td>文件数越多越慢</td><td>累积可观</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>表里最后两行值得单独说，因为它们各自对应一个真实的坑。倒数第二行：在容器里 <code>rm</code> 一个镜像自带的大文件，操作是瞬时的，磁盘空间不降反升（多了个标记），镜像体积也一点没变——如果你想净化镜像，唯一正确的做法是在 Dockerfile 里删完再合并成同一层，或者一开始就别 COPY 进去，参照第 05 章的多阶段构建。最后一行：写放大不只来自单个大文件，也来自海量小文件，因为每个文件都可能触发一次独立的复制与元数据操作，这就是为什么在可写层里跑一个包管理器安装几百个依赖会很慢。</p>
+
+        <p>还有一层更隐蔽的代价，很多人从来没算过：可写层的空间记在谁头上？在 Linux 上它在 <code>/var/lib/docker/</code> 里面，在 Windows 的 Docker Desktop 上它在 WSL2 虚拟机的虚拟磁盘文件里。这个虚拟磁盘文件有个著名的性质——它会随使用增长，但默认不会自动缩回去。所以你在容器里写满 20 GB 又删掉，宿主机上那 20 GB 可能依然被占着。这不是 Docker 的 bug，而是"稀疏磁盘 + 可写层从不主动整理"共同的结果。想收回来，得走一次专门的压缩流程，这是第 04 章讲磁盘清理时埋下的那根线。</p>
+
+        <p>现在做本章第一个完整实验，它不需要 Postgres、不需要网络，两分钟就能做完，但你会亲眼看到写放大的形状。</p>
+
+        <pre data-lang="bash"><code>docker run --rm alpine sh -c "dd if=/dev/zero of=/bigfile bs=1M count=200 && ls -lh /bigfile && rm /bigfile && echo deleted"</code></pre>
+        <p class="cmd-note">你会看到 <code>200+0 records in</code>、一个 200M 的文件、然后是 <code>deleted</code>。关键不在这条命令本身，而在于：这 200 MB 全部落在了这个容器的可写层里。用 <code>docker system df</code> 在命令执行期间和之后各看一次，你就能观察到容器层的空间占用变化；而 <code>rm</code> 之后，即使容器被 <code>--rm</code> 一并清理，Docker Desktop 的虚拟磁盘也不会立刻把体积还给你。</p>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>学存储这一块，最有效的思维习惯是问一句"<strong>这个成本由谁承担</strong>"。可写层的写放大，成本由宿主机磁盘和 IO 承担；绑定挂载的跨系统调用，成本由虚拟机边界的每一次文件操作承担；数据卷的抽象，成本由"你不能直接 <code>ls</code> 到它"这件事承担；备份的成本由你的时间与存储承担。任何一个"用起来很方便"的方案，都能找到它的承担者。找到承担者，你就找到了它的失效边界；找不到承担者，说明你还没看穿它。这个方法你在第 07 章学网络、第 09 章学安全时都可以原样搬过去用。</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>如果容器完全可以在可写层里读写文件，那"容器内数据持久化"这个概念是不是自相矛盾？请用你自己的话说明：到底是哪一部分在"不持久"，又是哪一部分在"持久"。<span class="sub">提示：把"容器这个对象"和"容器里那个进程正在操作的数据"分开看，它们是两条不同的生命周期。</span></li>
+            <li>假设你有一个只读、从不被修改的 3 GB 数据集要喂给训练脚本。放进可写层会有什么后果？放进只读挂载的卷又会有什么不同？在这两种情况下，"复制"这件事分别发生在什么时候？<span class="sub">提示：只读这一点非常关键，它决定了写时复制有没有机会被触发。</span></li>
+            <li>为什么"删除镜像里的一个大文件"不能让镜像变小？请从层的记账方式给出解释，然后说明如果一定要让镜像变小，正确做法应该落在 Dockerfile 的哪一步。<span class="sub">提示：想想每一层记的是"变化"还是"状态"。</span></li>
+          </ol>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 09 章会讲容器安全，其中有一整节围绕"卷里的敏感数据"展开：卷的默认权限、以非 root 用户运行时能不能写进去、容器能不能越权读到宿主机上被挂载进来的目录、以及为什么把 <code>/var/run/docker.sock</code> 挂进容器等于把宿主机的钥匙交出去。你现在只需要记住一个伏笔：<strong>挂载是双向的门，不是单向的取物口。</strong> 你让容器看见宿主机的东西，同时也让容器有机会碰到宿主机的东西。</p>
+        </div>
+
+        <h2 id="s2">三种让数据活下去的方式，以及它们背后的三种所有权</h2>
+
+        <p>要让数据活过容器的死亡，Docker 给了你三种手段。初学者常把它们当成三个可以随便挑的选项，其实它们回答的是三个不同的问题。数据卷（Volume）问的是"让 Docker 替你保管一份存储"；绑定挂载（Bind Mount）问的是"把我宿主机上的这个具体位置直接接到容器里"；tmpfs 问的是"这份数据能不能干脆不要落磁盘"。所有权不同，带来的路径形式、跨平台行为、备份难度、性能特征全都不一样。</p>
+
+        <p>先说数据卷。当你执行 <code>docker volume create appdata</code>，Docker 会在自己的数据目录（Linux 上通常是 <code>/var/lib/docker/volumes/appdata/_data</code>）下面建一个目录，并把它登记在自己的管理清单里。这个"登记"动作才是数据卷真正的价值所在：它不再只是一个目录，而是一个<strong>有名字、有元数据、能被 Docker 命令操作的一等对象</strong>。<code>docker volume ls</code> 能列出它，<code>docker volume inspect</code> 能看它的挂载点与创建时间，它能同时挂给五个容器，也能只读挂载。<strong>它的生命周期和容器彻底解耦</strong>：容器删了它还在，容器重建它还认得。</p>
+
+        <p>绑定挂载的思路完全不同。它不做任何"创建"动作，只是把宿主机上一个已经存在的路径，接到容器里的某个路径上。宿主机路径下的内容是什么，容器里就看到什么；容器往里写，宿主机的文件就变。它没有任何抽象层，因此特别透明也特别危险：你在容器里 <code>rm -rf /app</code>，删掉的是你宿主机上的真实文件，没有回收站，没有 <code>docker volume rm</code> 可以善后。它的另一个性质是"依赖宿主机的目录结构"——这既意味着你可以用随手建的目录、随意编辑文件、用你熟悉的编辑器，也意味着同一份 compose 文件在你同学的 D 盘上跑不起来，因为他的机器上没有 <code>D:\projects\myapp</code>。</p>
+
+        <p>tmpfs 是三者里最容易被忽视、又最有性格的一个。它把内容放在内存里，通过内核的临时文件系统实现，容器一停内容就消失，连痕迹都不留。它的使用场景只有两类，但这两类都很硬：一是生命周期天然短暂的临时数据（比如某个进程的临时目录、构建中间产物），二是绝不能落到磁盘上的敏感数据（比如解密后的密钥、会话令牌）。它还有一个副作用是快得离谱，因为内存的读写与磁盘差着好几个数量级——但请注意，快到这里已经不重要了，因为选它的理由从来不是快，而是"不该留下"。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>对比维度</th><th>数据卷 Volume</th><th>绑定挂载 Bind Mount</th><th>tmpfs</th></tr></thead>
+            <tbody>
+              <tr><td>谁管理这块存储</td><td>Docker 引擎管理，登记在引擎自己的清单里</td><td>宿主机操作系统管理，Docker 只是个"接线员"</td><td>内核管理，内容在内存中</td></tr>
+              <tr><td>位置长什么样</td><td>名字形式，如 <code>appdata</code>；Docker 决定真实路径</td><td>宿主机绝对路径，如 <code>D:\projects\app</code></td><td>不在文件系统里，无路径</td></tr>
+              <tr><td>典型用途</td><td>数据库数据目录、上传文件、需要备份的业务数据</td><td>开发时挂源码与配置、挂数据集、挂单文件配置</td><td>密钥、令牌、临时缓存、不需要留下的中间文件</td></tr>
+              <tr><td>容器删除后</td><td>数据保留，卷仍在 <code>docker volume ls</code> 里</td><td>数据保留，本来就在宿主机上</td><td>数据消失，无处可寻</td></tr>
+              <tr><td>Windows 上的路径写法</td><td>不用写路径，只写名字</td><td>必须写准确的宿主机路径，写法有三种，极易出错</td><td>不用写路径</td></tr>
+              <tr><td>性能（Windows + Docker Desktop）</td><td>较好，位于 WSL2 虚拟机内部的文件系统</td><td>明显较差，每次文件操作都要跨虚拟机边界</td><td>最好，但只在内存受限于内存大小</td></tr>
+              <tr><td>能否被 Docker 原生命令备份</td><td>可以，用临时容器挂载卷再打包，是标准流程</td><td>不需要 Docker，宿主机自己拷贝即可</td><td>不能，也不该备份</td></tr>
+              <tr><td>怎么删掉它</td><td><code>docker volume rm 卷名</code>；删容器时 <code>docker rm -v</code> 只删匿名卷</td><td>直接删宿主机目录，操作不可撤销</td><td>不需要删，容器停下即释放</td></tr>
+              <tr><td>最大风险</td><td>被 <code>docker system prune --volumes</code> 连带清掉</td><td>误删或误改宿主机真实文件</td><td>被误当成持久存储使用，重启后数据蒸发</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>表里有一格我故意写得不太一样："性能"这一行，在 Windows + Docker Desktop 上绑定挂载明显更差，但在 Linux 宿主机上两者其实相差不大，甚至绑定挂载有时还略快，因为它少了一层抽象。这说明性能从来不是这三种方式的本质差异，<strong>所有权才是</strong>。你在 Linux 服务器上做选择时，几乎不用考虑性能；而你在 Windows 笔记本上做选择时，性能会跳出来变成主要矛盾。这也预告了本章后面那一节存在的必要性——你的开发环境是一个特例。</p>
+
+        <p>现在回到那条被反复引用的判断准则：<strong>开发用绑定挂载，生产用数据卷</strong>。它成立的理由是这样的。开发阶段你最需要的是"改了就生效"：改一行 Python、存盘、容器里的进程重载，全程不重新构建镜像，这个循环越快你的效率越高。绑定挂载天然支持它，因为它没有任何缓存与复制，宿主机上文件一改容器立刻就看得见。生产阶段你最需要的是"可迁移、可备份、可管理"：这时你根本不希望应用和宿主机的目录结构绑死，你希望数据是一个能被清单管理、能被备份工具识别、能在机器之间搬家的对象，数据卷正是这个对象。</p>
+
+        <p>但它不是教条，有三种情况应该反过来想。第一种，生产环境里你要么不想让数据被"包"在一层抽象里，要么根本不允许：比如你的数据目录必须由宿主机的备份系统直接扫描、必须放在一块特定挂载点上（比如独立的数据盘、网络存储、加密卷），这时候绑定挂载或者直接在宿主机上跑数据库才是对的，强行塞进数据卷只会给运维添麻烦。第二种，你要挂进去的是单个文件而不是目录，比如 <code>/etc/nginx/nginx.conf</code> 这一份配置，用数据卷反而别扭，绑定挂载一个文件最直接。第三种，数据"太大以至于复制没有意义"：比如一个 500 GB 的训练数据集，你希望它就在宿主机某块盘上，容器只是只读地看它，这时绑定挂载是唯一合理的选择。反过来，开发时有一种情况不该用绑定挂载：挂载的目录会覆盖掉容器里的依赖。把宿主机上一个空目录挂到 <code>/app</code>，而镜像里 <code>/app</code> 下装好了 node_modules，你会发现依赖全没了——挂载是"覆盖"，不是"合并"。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>把宿主机目录挂到容器的依赖目录上，然后困惑"我刚装的依赖去哪了"。这不是 bug：挂载点的语义是<strong>用挂载源的目录内容整块替换容器里那个目录的视图</strong>，不是叠加上去。所以容器里原本 <code>/app/node_modules</code> 的内容会被宿主机那个（通常空的）目录盖住。对应有两种正确做法，取舍很清楚：一是在容器启动后重新安装依赖（慢，但宿主机干净）；二是把依赖目录单独用另一个卷挂载，让它在容器内独立存在、不受源码挂载影响（快，但多一个卷要管理）。第 08 章讲 Compose 时你会看到第二种做法被写成声明式配置，是容器化前端项目的标准形态。</p>
+        </div>
+
+        <h3 id="s2-1">动手实验：同一件事，三种挂法</h3>
+
+        <p>实验目的是让"三种方式在 <code>docker inspect</code> 眼里长什么样"变成你脑子里的画面。命令如下，三条分别是卷、绑定挂载、tmpfs。</p>
+
+        <pre data-lang="bash"><code>docker volume create sandbox
+docker run -d --name m1 -v sandbox:/data alpine sleep 300
+docker run -d --name m2 --mount type=bind,source="${PWD}",target=/work alpine sleep 300
+docker run -d --name m3 --tmpfs /run/secrets:size=1m alpine sleep 300</code></pre>
+        <p class="cmd-note">三条命令都会安静地返回一长串容器 ID。注意第二条用的是 <code>--mount</code> 语法，`source` 写的是宿主机当前目录（PowerShell 里 <code>${PWD}</code> 会自动展开成 <code>C:\Users\你\...\docker-learning</code>），`target` 是容器内路径。第三条的 <code>:size=1m</code> 给这块内存文件系统划了 1 MB 上限。</p>
+
+        <p>现在用同一条命令去看三者的差别，差别全在输出里的 <code>Mounts</code> 字段。</p>
+
+        <pre data-lang="bash"><code>docker inspect -f "{{json .Mounts}}" m1
+docker inspect -f "{{json .Mounts}}" m2
+docker inspect -f "{{json .Mounts}}" m3</code></pre>
+        <p class="cmd-note">三条命令各输出一段 JSON。m1 的 <code>Type</code> 是 <code>volume</code>，<code>Source</code> 指向 Docker 数据目录深处的 <code>.../volumes/sandbox/_data</code>，<code>Name</code> 是 <code>sandbox</code>。m2 的 <code>Type</code> 是 <code>bind</code>，<code>Source</code> 就是你宿主机上的真实目录。m3 的 <code>Type</code> 是 <code>tmpfs</code>，<code>Source</code> 是 <code>tmpfs</code> 这个词本身，因为它没有宿主机路径。这四种字段（Type、Source、Destination、Name）就是你判断"一个容器到底挂了什么"的硬证据，比猜和记忆可靠得多。</p>
+
+        <p>接着回答实验的问题：这三种方式里，哪一种是"我删掉容器之后数据一定还在"的？m1 和 m2 都是，m3 不是。哪一种是"我换了台电脑、这个容器还能跑起来"的？只有 m1（如果卷跟着搬过去），m2 会因为宿主机路径不存在而创建一个空目录，m3 本来就不需要数据。现在做变体：把 m2 的挂载路径改成一个你机器上不存在的目录（比如 <code>D:\not-exist-anywhere</code>），重新运行，然后去 D 盘看——你会发现 Docker 静默地帮你建了一个空目录。这个行为是本章第四节的主角，也是初学者最容易在无意识中污染宿主机文件系统的入口。</p>
+
+        <pre data-lang="bash"><code>docker run --rm --mount type=bind,source="D:\not-exist-anywhere",target=/work alpine ls /work
+docker volume ls
+docker rm -f m1 m2 m3
+docker volume rm sandbox</code></pre>
+        <p class="cmd-note">第一条命令不会报错，<code>ls /work</code> 输出为空——目录被自动创建了，Docker Desktop 在 Windows 上会替你把路径翻译过去。<code>docker volume ls</code> 里应该能看到 <code>sandbox</code>。最后两条把三个测试容器和那个卷清理干净。请你注意 <code>docker rm -f m1</code> 对命名卷毫无影响：即使没有后面那条 <code>docker volume rm</code>，<code>sandbox</code> 也会一直等着你。</p>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol start="4">
+            <li>既然绑定挂载就是"把宿主机的目录接进去"，那我们为什么不干脆全用宿主机的目录，还要多发明一个"数据卷"？请至少从三个角度给出理由，并说明每一个理由在什么场景下会不成立。<span class="sub">提示：可以从"谁负责清理""谁负责备份""同一份配置能不能在别人的机器上跑"这三个角度切进去。</span></li>
+            <li>你在 Linux 服务器上写了一个 compose 文件，用绑定挂载把 <code>/srv/app/config.yml</code> 接进容器，同事在他的 Windows 笔记本上跑不起来。请指出这是哪一类问题（是 Docker 的问题吗？），并给出两种不同的修法，说明各自的代价。<span class="sub">提示：一种修法是让配置不再依赖宿主机路径，另一种是让路径不再硬编码。</span></li>
+            <li>tmpfs 里的数据容器一停就没了。那它到底解决了什么问题？如果我把密钥写进 tmpfs，而容器重启了，我的服务会怎样？<span class="sub">提示：想想"重启后需要重新注入密钥"这件事，在工程上是负担还是安全保障。</span></li>
+          </ol>
+        </div>
+
+        <h2 id="s3">`-v` 与 `--mount`：两种语法，以及两个会让你丢数据的陷阱</h2>
+
+        <p>Docker 有两条命令可以做挂载，一条老、一条新。它们不是"新旧替代"的关系，而是两种表达风格，在某些细节上行为真的不一样，所以你必须同时认得它们。</p>
+
+        <p><code>-v</code>（也可以写成 <code>--volume</code>）用冒号分隔的三段式写法：<code>-v 源:目标:选项</code>。它非常紧凑，代价是紧凑本身就意味着信息被压缩了——你从字符串上看不出"源"到底会被解释成卷名还是宿主机路径。<code>--mount</code> 用键值对写法：<code>--mount type=bind,source=...,target=...,readonly</code>。它啰嗦，但每个字都说了自己在干什么，而且报错信息明显更清楚：<code>-v</code> 遇到问题时经常只是静默地做了一件你没打算做的事，<code>--mount</code> 则倾向于明确地失败并告诉你哪里不对。第 04 章我们给自己的纪律是"生产环境用更明确的写法"，这条纪律在挂载上尤其值钱。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>你想做的事</th><th><code>-v</code> 写法</th><th><code>--mount</code> 写法</th><th>要注意的差别</th></tr></thead>
+            <tbody>
+              <tr><td>把命名卷挂到容器目录</td><td><code>-v appdata:/app/data</code></td><td><code>--mount source=appdata,target=/app/data</code></td><td><code>--mount</code> 里 <code>type</code> 可以省略，写了卷名就默认是卷</td></tr>
+              <tr><td>把宿主机目录挂进去</td><td><code>-v ./data:/app/data</code></td><td><code>--mount type=bind,source=./data,target=/app/data</code></td><td><code>-v</code> 里以 <code>.</code> 或 <code>/</code> 开头才被认成路径；<code>--mount</code> 必须写 <code>type=bind</code></td></tr>
+              <tr><td>只读挂载</td><td><code>-v appdata:/app/data:ro</code></td><td><code>--mount source=appdata,target=/app/data,readonly</code></td><td>语义相同，后者更不容易看漏</td></tr>
+              <tr><td>挂一个 tmpfs</td><td><code>--tmpfs /tmp:size=64m</code></td><td><code>--mount type=tmpfs,target=/tmp,tmpfs-size=67108864</code></td><td>大小单位不同，一个用可读的 <code>64m</code>，一个用字节数</td></tr>
+              <tr><td>卷不存在时</td><td>自动创建同名卷</td><td>自动创建同名卷</td><td>两者都会替你创建，这既是方便也是陷阱</td></tr>
+              <tr><td>宿主机路径不存在时</td><td>静默创建一个空目录</td><td>报错退出，提示路径不存在</td><td><strong>这就是两条语法最重要的行为差异</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>表格最后一行值得你停下来多看两眼。它是很多人第一次真正意识到"两种语法不是同义词"的地方。用 <code>-v ./data:/app</code>，如果当前目录下没有 <code>data</code> 文件夹，Docker 会建一个空文件夹然后继续跑；你的容器启动成功、日志干净、唯一的症状是"数据好像没了"。而同样的意图写成 <code>--mount type=bind,source=./data,target=/app</code>，Docker 会直接报错拒绝启动。<strong>在数据这件事上，一个响亮的失败远好过一个安静的错误。</strong> 这就是为什么我在自己的项目里几乎只用 <code>--mount</code> 写绑定挂载：不是为了显得规范，而是因为我希望路径写错时程序立刻告诉我，而不是让我在三天后排查"为什么配置没生效"。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>本节第一个陷阱，也是最经典的一个：<code>-v mydata:/app</code> 和 <code>-v ./mydata:/app</code> 只差两个字符，含义却完全不同。前者是<strong>命名卷</strong>，Docker 在自己的数据目录下管理，你 <code>ls</code> 不到；后者是<strong>绑定挂载</strong>，真实落在你当前工作目录下的 <code>mydata</code> 文件夹里。判断规则只有一条：源的部分以 <code>.</code> 或 <code>/</code>（Windows 上是盘符或 <code>//</code>）开头，就是路径；否则就是卷名。请养成本能，写完 <code>-v</code> 之后用 <code>docker inspect -f "{{json .Mounts}}" 容器名</code> 确认一次 <code>Type</code> 到底是 <code>volume</code> 还是 <code>bind</code>。这个动作五秒钟，能省你几小时。</p>
+        </div>
+
+        <blockquote><p>在数据这件事上，一个响亮的失败远好过一个安静的错误。工具替你"顺手"做的决定越多，你失去的知情权就越多。</p></blockquote>
+
+        <p>上面这些讲完，第二个悬念可以揭晓了。前面我问：如果一个东西可以被写，它是否就等于可以被依赖？现在你手上有足够的材料回答。可以写，说明的是<strong>这个路径在本次容器生命周期内可读可写</strong>；可以被依赖，要求的是<strong>这份内容在下一个容器、下一台机器、下个月依然存在且内容一致</strong>。这是两个完全不同层次的命题，前者由 OverlayFS 提供，后者只能由你显式设计的存储方案提供。可写层满足前者而彻底不满足后者；数据卷与绑定挂载满足后者。而 <code>docker exec</code> 进去改配置之所以让人产生"容器有状态"的错觉，原因在于你验证的时机：你改完立刻看了一眼，看到了改动，于是相信了。这就像在沙滩上写字然后立刻回头看——字确实在，只是它不在任何会被保存的地方。可靠的验证方式是问一句"这个改动能否活过我下一次 <code>docker rm</code>"，答案几乎总是不能。</p>
+
+        <p>顺着这条线索，还有一件很多人做过、也后悔过的事：<code>docker commit</code>。它把容器当前的可写层打包成一个新镜像，从技术上讲，你确实"保存"了改动。但从工程上讲这不是解决方案，而是把问题藏起来：这样得到的镜像没有 Dockerfile、没有构建记录、不能复现、不能审查、体积还会把整个可写层一起带上。第 05 章反复强调镜像应该是可复现的文本产物，<code>docker commit</code> 恰好是它的反面。所以正确的结论是：<strong>可写层里的任何改动都不值得保留，值得保留的东西应该在它诞生之前就落到卷或宿主机上。</strong></p>
+
+        <details>
+          <summary>展开：为什么 <code>--mount</code> 的报错更"贵"也更"值"</summary>
+          <p>从工程文化的角度看，这两条语法的差异是一个很好的教材。命令行的两种设计哲学在这里撞在一起：一种追求"最少按键"，遇到模糊情况就选一个"最可能对"的解释然后继续跑；另一种追求"最少歧义"，遇到模糊情况就停下来要求你说清楚。前者让人上手快，后者让人半夜少被叫醒。容器工具链整体正在朝第二种演进——<code>--mount</code> 取代 <code>-v</code>、长参数逐渐取代短参数、显式声明取代隐式推断。</p>
+          <p>这里有一个可以迁移到任何工具上的问题：当你设计一个命令行工具、一个 API、甚至一个函数签名时，遇到"用户没写清楚"的情况，你是替他猜，还是让他失败？判断的依据是"猜错的代价有多高"。如果猜错只是排版难看，替他猜是善意；如果猜错会删掉一个数据库，让他失败才是负责。你以后写脚本、写 CI 配置、给同学写部署说明时，都会用到这个判断。</p>
+        </details>
+
+        <h2 id="s4">空卷初始化：一个真实存在的"神秘现象"，以及它如何骗过你</h2>
+
+        <p>接下来这套语义，是本章最像"魔法"、也最容易引发真实事故的一段。规则本身很短：<strong>当你把一个空的数据卷挂载到容器里一个原本非空的目录上时，Docker 会把镜像里那个目录的内容复制进这个卷，只复制这一次。</strong> 而当你把一个非空的数据卷挂到同样的位置时，容器里看到的完全是卷里的内容，镜像里那一份被彻底遮住，Docker 什么都不做。</p>
+
+        <p>先亲眼看一次。nginx 官方镜像的 <code>/etc/nginx</code> 目录里有一堆配置文件，正好用来当标本。</p>
+
+        <pre data-lang="bash"><code>docker run --rm -v nginxconf:/etc/nginx nginx ls /etc/nginx
+docker volume inspect nginxconf</code></pre>
+        <p class="cmd-note">你会看到 <code>conf.d</code>、<code>fastcgi_params</code>、<code>mime.types</code>、<code>nginx.conf</code>、<code>scgi_params</code>、<code>uwsgi_params</code> 等文件——它们本来就在镜像里，而卷是全新的、空的，所以这是 Docker 替你复制进去的结果。<code>docker volume inspect</code> 会显示这个卷的 <code>Mountpoint</code>，你可以顺着这个路径去 WSL 里看到同样的文件。注意这条命令用了 <code>--rm</code>，所以容器本身已经不存在了，但 <code>nginxconf</code> 这个卷和它里面的内容还在。</p>
+
+        <p>再对比一次：如果我挂一个空目录进去，路径完全不同，行为也不同。</p>
+
+        <pre data-lang="bash"><code>docker run --rm -v emptyvol:/empty alpine sh -c "mkdir -p /empty && ls -la /empty"
+docker volume ls -f dangling=true</code></pre>
+        <p class="cmd-note">这时卷里什么都没有（因为镜像里的 <code>/empty</code> 本来就不存在，没有东西可复制）。第二条命令列出所有"悬空卷"——不被任何容器引用的卷。<code>nginxconf</code> 会出现在这个列表里，因为它已经不被任何容器使用了。这是你日后排查"磁盘被谁吃了"的第一个入口。</p>
+
+        <p>现在讲这个语义为什么会造成真实困惑，以及它的两个后果。</p>
+
+        <p>后果一：<strong>"我改了镜像里的文件，容器里却没变"。</strong> 假设你有一个项目，把配置文件 <code>app.conf</code> 通过 <code>COPY</code> 写进了镜像的 <code>/app/conf/</code>，同时你用 <code>-v appconf:/app/conf</code> 挂了一个卷。第一次启动时卷是空的，Docker 把镜像里的 <code>app.conf</code> 复制进去了。之后你发现配置写错了，改了 Dockerfile 重新 <code>docker build</code>，再重启容器——你看到的是<strong>旧配置</strong>，因为卷已经不是空的了，Docker 不会再复制第二次。你会怀疑构建没生效，去检查镜像里的文件（确实改了），然后陷入更深的困惑。真相是：卷里那一份才是容器实际读到的那一份，而它停留在第一次启动那一刻。解法有三个，各有代价：把卷删掉重建（数据一起没了，开发环境可接受）、把配置改成只读绑定挂载单个文件（最干净）、或者干脆别把配置放进被卷覆盖的目录（设计上最正确）。第 08 章讲 Compose 时会用 <code>configs</code> 与只读挂载把这件事做成规范。</p>
+
+        <p>后果二：它与"卷里已经有数据"的情形共同构成一个不对称的规则，而这个不对称正好是很多人期待的。想想一个数据库镜像：<code>postgres</code> 镜像声明了数据目录作为卷。第一次启动，数据目录是空的，镜像里的初始化脚本会把数据库集群文件写进去。第二次启动，数据目录非空，初始化被跳过，你的数据平安回来。这套机制之所以成立，恰恰依赖我们上面那条规则——空则复制、非空则不动——加上数据库自身的"只在目录为空时初始化"逻辑，两层配合才产生了"第一次建库、之后沿用"的体验。理解了这条链，你就能解释本章后面那个经典疑问："我改了密码，为什么没生效？"</p>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>遇到任何"配置改了没生效""数据没更新""看起来像缓存的怪现象"，请固定走这条三步法：<strong>先问它的物理位置，再问它的时间戳，最后才问逻辑</strong>。第一步确定容器实际读到的是哪个文件（<code>docker inspect</code> 看 Mounts，<code>docker exec</code> 进去 <code>ls -l</code> 看路径与属主）；第二步比较这个文件的修改时间和你刚才改动的时间（如果文件的时间停留在很久以前，那说明你改的根本不是它）；第三步才回到应用层去找逻辑错误。初学者的本能是从第三步开始猜，而有经验的人几乎总是先做完前两步——因为绝大多数的"怪现象"，答案都是"你改了 A，程序读的是 B"。这套顺序在排查环境变量、配置文件、证书、模型文件时全都适用。</p>
+        </div>
+
+        <details>
+          <summary>展开：为什么 Docker 要设计"空卷复制"这个行为，而不是干脆留空</summary>
+          <p>设想没有这条规则的世界。你写了一个镜像，把 nginx 的默认配置放在 <code>/etc/nginx</code>，然后挂一个卷进去覆盖它。如果卷是空的、Docker 不做任何复制，那么容器启动时会因为找不到 <code>nginx.conf</code> 而直接崩溃。用户此时必须知道"这个卷里应该先放什么"，而这件事往往只有镜像作者知道。</p>
+          <p>这条规则把"卷的初始内容"这件事从用户手里接了过来，让镜像自带的默认值成为卷的起点。它服务的典型场景是"我要覆盖这个目录里的一项配置，但我想保留其他默认值"：卷被初始化成一份完整的默认配置，你在里面改你想改的那一份，其余照旧。这是"约定优于配置"思想的一个落地。</p>
+          <p>代价就是前面讲的那些困惑：初始化的语义是"一次性的、藏在启动过程中的"，而任何一次性且不可见的动作都会在后来被误读。一个可迁移的教训是：设计系统时，如果某个动作只在第一次发生时执行、之后永远静默跳过，那么它一定会成为故障排查的黑洞——你必须把它写进日志，或者给它一个显式的、可查询的状态。</p>
+        </details>
+
+        <h2 id="s5">匿名卷、磁盘黑洞，以及"卷到底存在哪儿"</h2>
+
+        <p>第一节末尾的动手实验里已经出现过悬空卷，现在把匿名卷这条线讲透。匿名卷（Anonymous Volume）是没有名字、由 Docker 自动生成一串随机 ID 的数据卷。它出现的途径主要有两条：Dockerfile 里写了 <code>VOLUME /var/lib/postgresql/data</code> 这样的指令，而你启动容器时没有为那个路径指定任何挂载；或者在 Compose 里只写了容器内路径，没有映射到具名卷。</p>
+
+        <p>匿名卷本身不是错误设计。像 <code>postgres</code>、<code>mysql</code>、<code>redis</code> 这类官方镜像声明 <code>VOLUME</code>，其用意是很体贴的：它在说"我这个目录里的数据很重要，请务必让它落在镜像层之外"。如果你什么都不做，Docker 就给你自动配一个匿名卷，你的数据至少不会随容器一起灰飞烟灭。这份体贴在第一周救过很多人。</p>
+
+        <p>问题是它的生命周期管理很反直觉。<strong>删除容器时，匿名卷默认不会被删掉。</strong> 也就是说 <code>docker rm pgdemo</code> 之后，那个随机 ID 的卷还在磁盘上，你再也想不起来它属于谁、里面是什么，而它就那样占着几百 MB 或几个 GB。反复调试数据库、反复重建容器的人，会在一两个月后发现自己磁盘上有几十个这样的卷。这就是"磁盘黑洞"这个词的来源：它不是一次灾难，而是一种持续的小额泄漏。</p>
+
+        <p>先做出一个匿名卷，然后看它怎么留下。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name anon1 -e POSTGRES_PASSWORD=secret postgres:16
+docker volume ls --filter dangling=true
+docker rm -f anon1
+docker volume ls --filter dangling=true</code></pre>
+        <p class="cmd-note">第一条命令没有写任何 <code>-v</code>，但 Postgres 镜像里的 <code>VOLUME</code> 指令会让 Docker 自动创建一个随机名字的卷。第二条命令列出的悬空卷里会出现一个 64 位十六进制 ID 的条目。第三条命令强制删掉容器，第四条再列一次——那个匿名卷<strong>依然在那里</strong>，因为删容器默认不动卷。这就是黑洞成形的那一刻。</p>
+
+        <p>要让它一起消失，需要显式加参数。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name anon2 -e POSTGRES_PASSWORD=secret postgres:16
+docker rm -fv anon2
+docker volume ls --filter dangling=true</code></pre>
+        <p class="cmd-note"><code>docker rm -fv</code> 里的 <code>-v</code> 意为"顺带删除这个容器关联的匿名卷"。注意它的精确语义：它只删匿名卷，<strong>不动命名卷</strong>。这是 Docker 一个相当克制的设计：它认为"你给卷起了名字，就是表达了要保留的意愿"。所以 <code>-v</code> 不是"删除所有挂载数据"，把它当成后者来理解，总有一天会误伤。这也是第 04 章提到 <code>docker rm -v</code> 时的伏笔所在。</p>
+
+        <p>接着看那个真正危险的动作。<code>docker system prune</code> 是清理磁盘的常用命令，加上 <code>--volumes</code> 之后它会连未被使用的卷一起删。请你把这句话读两遍：<strong>未被使用的卷</strong>，包括那些名字起得很规范、里面装着你三个月前辛辛苦苦攒下来的业务数据的卷——只要它此刻没有挂在任何运行中的容器上，就在清理范围里。</p>
+
+        <pre data-lang="bash"><code>docker system df
+docker system df -v</code></pre>
+        <p class="cmd-note"><code>docker system df</code> 输出四个大类：镜像、容器、本地卷、构建缓存，各占多少空间、其中多少是可回收的。这是你应该每周看一眼的命令。<code>docker system df -v</code> 会展开到每一个具体对象，包括每个卷的大小、链接到它的容器数量。<code>LINKS</code> 为 0 的卷，就是下一次 <code>prune --volumes</code> 的候选。你在这里看到的每一个数字，都是"要不要执行那条命令"的判断依据。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p><code>docker system prune -a --volumes</code> 这条命令在网上的"清理 C 盘教程"里出现频率极高，而它会把未被使用的卷全部删掉。请把它和你人生中"格式化硬盘"归入同一类操作：执行前必须先用 <code>docker system df -v</code> 看清将失去什么，并且确认重要卷已经备份过。另一条平行纪律：在你还不确定一个卷里有什么之前，宁可让它占着空间，也不要执行带 <code>--volumes</code> 的清理。空间可以再买，数据不能。</p>
+        </div>
+
+        <h3 id="s5-1">动手实验：亲手制造一个黑洞，再亲手填上</h3>
+
+        <p>实验目的是把"存在哪、占多少、怎么清"变成可测量的经验，而不是抽象概念。</p>
+
+        <pre data-lang="bash"><code>docker volume create blackhole-demo
+docker run --rm -v blackhole-demo:/data alpine sh -c "dd if=/dev/zero of=/data/junk bs=1M count=100"
+docker system df -v
+docker volume rm blackhole-demo</code></pre>
+        <p class="cmd-note">第二条命令往卷里写了 100 MB 的零字节文件；容器退出后被 <code>--rm</code> 清掉，但卷和里面的 100 MB 全留着。第三条 <code>docker system df -v</code> 的 <code>VOLUME NAME</code> 一栏能看到 <code>blackhole-demo</code>，<code>SIZE</code> 大约 100 MB 上下（具体数字取决于文件系统与稀疏文件的处理），<code>LINKS</code> 为 0。最后一条把它删掉，再跑一次 <code>docker system df</code>，你会看到本地卷那一行的占用降了下来。</p>
+
+        <p>现在追问一个变体，它比实验本身更重要：如果这个卷里装的不是能随便重建的垃圾，而是你唯一一份课程设计的数据，你会怎么把它救出来？<code>docker volume rm</code> 没有回收站，卷被删的那一刻，内容就跟着没了。所以真正的问题不是"怎么删"，而是"我凭什么知道可以删"。这个问题我们留到生命周期那一节正面回答，现在只需要记住一个可执行的动作：<strong>在对任何卷执行删除之前，先做一次备份，哪怕这次备份看起来很多余。</strong></p>
+
+        <details>
+          <summary>展开：卷在 Docker Desktop 上到底存在哪个文件夹</summary>
+          <p>这个问题有一个精确答案，但它取决于你的后端和 WSL 发行版名称。在 WSL2 后端下，Docker Desktop 把引擎跑在一个专门的 WSL 发行版里（通常名字形如 <code>docker-desktop</code>）。那个发行版的整个根文件系统是一个虚拟磁盘文件，存放在你的 Windows 用户目录下类似 <code>%LOCALAPPDATA%\Docker\wsl\</code> 的位置。卷的实际数据则是这个虚拟磁盘里面 <code>/var/lib/docker/volumes/&lt;卷名&gt;/_data</code> 这样的路径。</p>
+          <p><code>docker volume inspect 卷名</code> 输出的 <code>Mountpoint</code> 字段告诉你的，就是"在引擎所在的那个文件系统里，这个卷在哪儿"。注意它打印的是一个 Linux 风格路径，因为打印它的引擎本身跑在 Linux 里——但这个路径在你的 Windows 资源管理器里直接输入是打不开的。想亲眼看到文件，要么进 WSL（在 PowerShell 里执行 <code>wsl -d docker-desktop</code> 之类，具体发行版名可用 <code>wsl -l -v</code> 查看），要么更省事的办法：起一个容器把卷挂上然后 <code>ls</code>。</p>
+          <p>请你体会这个问题背后的意思。"我的数据到底存在哪"在 Windows 上是一个四层答案：Windows 的虚拟磁盘文件 → WSL 发行版的根文件系统 → Linux 的 <code>/var/lib/docker/volumes/</code> → 卷目录。链条越长，你能直接动手的地方越少，也越依赖 Docker 自己提供的命令去管理数据。这是"用抽象换方便"的典型代价，不是缺陷，但你必须知道它存在。</p>
+        </details>
+
+        <h2 id="s6">Windows + Docker Desktop：你的挂载比别人多跨一道门</h2>
+
+        <p>前面几节讲的原理是通用的，但有一个体验差异我必须单独讲，因为你是在 Windows 上跟着这本书敲命令的。第 02 章讲过，Docker Desktop 在 Windows 上其实是偷偷开了一台 Linux 虚拟机（默认用 WSL2），把 Docker Engine 跑在里面，再把命令行接进去。这台虚拟机的存在，对网络和存储各有一个后果。网络的后果是端口映射走了一层转发，我们留到第 07 章；存储的后果是——<strong>当你把 Windows 上的目录挂进容器时，每一次文件读写都要穿过虚拟机的边界。</strong></p>
+
+        <p>穿过边界的代价有多大，取决于你怎么用。如果你的应用每秒读几百个小文件（典型场景：Python 解释器导入模块、Node 解析依赖、前端构建工具扫描源码），每个文件都变成一次跨系统的往返调用，累积起来的差距是数量级的。这个现象有个直观的体验：同样一份 <code>npm install</code>，在 Windows 盘符上的项目里跑要几分钟，把项目挪到 WSL 文件系统里再跑可能只要几十秒。这不是玄学，就是边界成本。</p>
+
+        <p>比性能更容易让你抓狂的是第二件事：<strong>文件变更通知经常失效。</strong> 很多开发工具靠操作系统的文件通知机制来感知"源码变了，重新加载"。Linux 上这个机制叫 inotify，Windows 上有自己的一套。问题在于，当你的项目在 Windows 盘符上、而监听程序跑在 Linux 虚拟机里的容器中时，Windows 上的文件变化事件往往不能可靠地传到容器里。于是你会遇到这样的场景：你在 VS Code 里改了 Python 代码、保存，Flask 或 Uvicorn 的自动重载毫无反应，你必须手动重启容器；前端的热更新同样失灵，浏览器上的页面永远是旧的。<strong>这不是你的配置写错了，而是事件本身就丢了。</strong></p>
+
+        <p>三个变通方案，各自的代价我一起写清楚，你可以按项目性质挑。</p>
+
+        <p>方案一：把项目文件搬进 WSL 的文件系统。在 WSL 里你的家目录通常是 <code>\\wsl$\</code> 这样的 UNC 路径可以访问的地方，把项目放在那儿，然后用绑定挂载挂进容器。这个方案同时解决性能与通知两个问题，因为它让源码和容器处在同一台 Linux 里，没有边界要跨。代价是：Windows 侧的编辑器要通过 UNC 路径访问，速度略慢；Windows 上的部分工具（尤其涉及大量文件扫描的）在 UNC 路径上可能水土不服；你的项目位置不再是熟悉的 <code>D:\</code> 而是一条网络路径。第 02 章提到过 WSL2 的定位，这里是它最实在的一个收益点。</p>
+
+        <p>方案二：改用轮询模式。绝大多数开发服务器都提供"不依赖文件通知，改为定时扫描文件"的开关：Flask 用 <code>--reload</code> 配合 watchdog 并设置 <code>WATCHDOG_FORCE_POLLING</code>，前端构建工具里有 <code>usePolling: true</code>，Python 的热重载库也有各自的强制轮询选项。这个方案改动最小，代价是 CPU 占用升高（轮询是反复扫描，不是按需唤醒），而且响应有延迟。项目小的时候完全够用，项目大了会变得很难受。</p>
+
+        <p>方案三：把依赖装进卷、只把源码挂进去，然后完全放弃热重载，改成"改完代码重启容器"。这听起来最笨，实际上在很多项目上是稳定的选择：重启一个容器只要几百毫秒到一两秒，比起为了热重载折腾半天环境，可能还更省时间。这也顺便解决了前面提到的"挂载覆盖依赖目录"问题。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>方案</th><th>文件读写性能</th><th>文件变更通知</th><th>主要代价</th><th>适合什么项目</th></tr></thead>
+            <tbody>
+              <tr><td>项目放在 Windows 盘符，直接绑定挂载</td><td>较差，小文件密集时最明显</td><td>常常失效</td><td>热重载不可用，构建慢</td><td>偶尔跑一次的脚本、纯演示</td></tr>
+              <tr><td>开启轮询模式，仍挂 Windows 盘符</td><td>较差，且轮询加重负担</td><td>可靠但滞后</td><td>CPU 占用升高，大项目变慢</td><td>中小型 Web 项目、教学练习</td></tr>
+              <tr><td>项目放进 WSL 文件系统再挂载</td><td>接近原生 Linux</td><td>正常</td><td>路径变成 UNC 形式，Windows 侧工具偶有不适</td><td>日常开发的主力项目</td></tr>
+              <tr><td>源码也放进镜像，改完重建</td><td>最快，全在镜像层</td><td>不需要通知</td><td>每次改动都要重建，开发循环变长</td><td>验证构建产物、接近生产的测试</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>然后是路径写法。这是 Windows 上最琐碎、也最容易一次踩中好几个坑的地方，我把它写成可以照抄的清单。</p>
+
+        <p>第一种写法是绝对路径加反斜杠：<code>-v D:\projects\myapp:/app</code>。在 PowerShell 里这通常能工作，Docker Desktop 会负责翻译。但它有三个隐患：反斜杠在某些上下文（尤其是写在 Compose 的 YAML 里）有转义含义；路径里有空格时必须加引号；把这条命令发给同学，他必须正好也有 <code>D:\projects\myapp</code>。</p>
+
+        <p>第二种写法是用 PowerShell 的自动变量 <code>${PWD}</code>：<code>-v "${PWD}:/app"</code>。这是我的推荐做法，因为它是"相对于我当前所在位置"的，天然可移植，而且用双引号包住就自动处理了空格。<code>${PWD}</code> 在 Windows PowerShell 5.1 和 PowerShell 7 里都可用，是当前目录对象，放进字符串时会被转换成 Windows 风格路径。想要用户主目录，用 <code>$env:USERPROFILE</code>（Windows 侧）或 <code>$HOME</code>（WSL 侧）都行。</p>
+
+        <p>第三种写法是 Linux 风格的 <code>//d/projects/myapp</code>。这种形式来自 Git Bash 与 MSYS 环境下的路径习惯，Docker Desktop 也认。如果你日后在 WSL 里敲命令，还会见到 <code>/mnt/d/projects/myapp</code> 这种形式——那是 WSL 把 Windows 盘符挂载到 <code>/mnt</code> 下的结果。同一个文件夹，在三种不同的 shell 里有三种不同的写法，这个事实本身就是"你其实同时在使用两套操作系统"的证据。</p>
+
+        <pre data-lang="bash"><code>docker run --rm -v "${PWD}:/work" alpine ls -l /work
+docker run --rm -v "$env:USERPROFILE\dockerlab:/lab" alpine ls -l /lab</code></pre>
+        <p class="cmd-note">第一条命令把当前目录挂到容器的 <code>/work</code>，你会看到自己项目里的文件列表——这是最常用的开发挂载形式。第二条用 <code>$env:USERPROFILE</code> 把主目录下的 <code>dockerlab</code> 挂进去；如果这个文件夹不存在，Docker 会静默创建它（回忆前面讲过的那个陷阱）。注意 PowerShell 里访问环境变量用 <code>$env:NAME</code> 而不是 <code>$NAME</code>，这两种形式在同一个命令行里混用时最容易被写错。</p>
+
+        <pre data-lang="bash"><code>docker run --rm --mount type=bind,source="${PWD}",target=/work alpine sh -c "echo hi > /work/from-container.txt"
+Get-Content .\from-container.txt</code></pre>
+        <p class="cmd-note">这一对命令演示了绑定挂载的"双向"性质：容器往 <code>/work</code> 写了一个文件，你在宿主机当前目录立刻能读到它。第二行是 PowerShell 的读文件命令。<strong>请注意这意味着容器里的进程对你的项目目录有写权限</strong>——它既是热更新的原理，也是"容器把我源码改坏了"这类事故的原理。第 09 章会讲怎么用只读挂载和最小权限把这份权力收窄。</p>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 02 章讲 Docker 架构时说过，Windows 上的 Docker Desktop 其实是"C/S 架构 + 一台替你开好的 Linux 虚拟机"。当时那句话是用来解释"为什么你要重启电脑开启虚拟化功能"和"为什么容器里的路径是 <code>/app</code> 而你的文件在 <code>D:\</code> 上"。现在这台虚拟机变成了一个具体的性能与事件问题：它是一道文件系统边界，你要么把数据搬过去（放进 WSL），要么接受跨边界的成本（继续挂 Windows 盘符），要么用轮询绕开事件丢失（降低体验）。没有第四条路，因为容器的本质是 Linux 进程，它必须住在 Linux 里。</p>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 07 章讲网络时，你会遇到这台虚拟机带来的另一类现象：宿主机和容器看到的 IP 不一样、<code>localhost</code> 在两边含义不同、端口映射在某些情况下行为诡异。到那时请回想本节的方法：<strong>先确定"谁住在哪台机器里"，再判断这条消息要跨几道门。</strong> 存储与网络在容器里是同一件事的两个投影——都是"两台机器之间的边界"问题，只是一个搬的是文件，一个搬的是数据包。</p>
+        </div>
+
+        <h2 id="s7">备份与恢复：唯一能证明备份存在的动作，是恢复</h2>
+
+        <p>现在讲本章最实用、也最容易被跳过的一节。多数人对备份的态度是"我知道应该做"，然后什么也不做；稍好一点的人做了备份脚本，然后从来没有试过恢复。这两种状态在真正的灾难面前没有区别。原因很简单：<strong>备份是一个动作，可恢复性是一个性质</strong>，动作成功不代表性质成立。你的 tar 文件可能因为权限问题少了一部分内容，可能因为路径写错打进了空气，可能因为卷在备份的那一刻正被写入而处于不一致状态。这些缺陷在备份时不报错，只在恢复时暴露——而你最不希望暴露它们的时刻，就是你真的需要那份数据的那一刻。</p>
+
+        <p>所以本节的目标不是教你一条打包命令，而是给你一条可以反复演练、结果可验证的完整流程。先讲原理，它很短：数据卷本质上就是一个目录，只是它住在 Docker 管理的文件系统里、你没有一条直接的路径能访问它。要把它打包出来，办法是<strong>起一个临时容器，同时挂上那个卷和一个宿主机目录，然后在容器里用 tar 把卷的内容打到宿主机目录里</strong>。这个临时容器不需要是数据库镜像，一个 <code>alpine</code> 就够了，因为它只做打包这件事。</p>
+
+        <p>第一步，准备一个有内容的卷。用 Postgres 建一个库、写一条记录，作为后面验证的基准。</p>
+
+        <pre data-lang="bash"><code>docker volume create pgdata
+docker run -d --name pgdemo -e POSTGRES_PASSWORD=secret -v pgdata:/var/lib/postgresql/data postgres:16
+docker exec pgdemo psql -U postgres -c "CREATE TABLE notes(id serial primary key, body text);"
+docker exec pgdemo psql -U postgres -c "INSERT INTO notes(body) VALUES ('这是备份演练的第一条记录');"
+docker exec pgdemo psql -U postgres -c "SELECT * FROM notes;"</code></pre>
+        <p class="cmd-note">第一条命令显式创建命名卷 <code>pgdata</code>，虽然不加它也会自动创建，但显式创建让你对自己的数据有名字可叫。第二条启动 Postgres 并把数据目录挂到卷上。接着三条命令在容器内用 <code>psql</code> 建表、插一条中文记录、查回来确认。你会看到一行 <code>1 | 这是备份演练的第一条记录</code>。选择用 <code>docker exec</code> 在容器内执行 <code>psql</code> 而不是在宿主机上装客户端，是因为 Postgres 镜像自带这份工具，你不需要额外安装任何东西——这也是容器的一个隐性好处。</p>
+
+        <p>第二步，备份。这条命令值得你逐字读懂。</p>
+
+        <pre data-lang="bash"><code>docker run --rm -v pgdata:/from -v "${PWD}:/to" alpine tar czf /to/pgdata-backup.tar.gz -C /from .</code></pre>
+        <p class="cmd-note">一个临时的 alpine 容器，同时挂两样东西：命名卷 <code>pgdata</code> 挂到容器里的 <code>/from</code>，你当前目录挂到 <code>/to</code>。然后在容器里执行 <code>tar czf /to/pgdata-backup.tar.gz -C /from .</code>：<code>czf</code> 意为用 gzip 压缩、输出到指定文件；<code>-C /from</code> 意为先切到 <code>/from</code> 再打包；最后那个 <code>.</code> 是"当前目录下的所有内容"。<strong><code>-C</code> 与 <code>.</code> 是这条命令的灵魂</strong>：它保证压缩包里的路径是相对的，将来解到哪里就在哪里落地，不会还原成一串你不想要的绝对路径。执行完，你当前目录下会出现 <code>pgdata-backup.tar.gz</code>。</p>
+
+        <p>第三步，验证备份文件本身。这一步几乎所有人都会跳过，而它能抓住最常见的失败。</p>
+
+        <pre data-lang="bash"><code>docker run --rm -v "${PWD}:/to" alpine sh -c "ls -lh /to/pgdata-backup.tar.gz && tar tzf /to/pgdata-backup.tar.gz | head -20"</code></pre>
+        <p class="cmd-note">两个动作：看文件大小（如果不是几十 MB 以上，说明 Postgres 的数据根本没打进去，很可能挂载路径写错了），以及列出压缩包内容的前若干条。<code>tar tzf</code> 只列不解。你应该看到 <code>./base/</code>、<code>./pg_wal/</code>、<code>./postgresql.conf</code> 这类条目。<strong>如果这里只看到空的或者只有一两个奇怪的文件，你的备份是假的——现在发现比三个月后发现好得多。</strong></p>
+
+        <p>第四步，也是最关键的一步：真的删掉原卷，然后从备份恢复到一个<strong>新的</strong>卷名。用新卷名是为了确保恢复的确实是 tar 里的内容，而不是碰巧读到了残留的旧卷。</p>
+
+        <pre data-lang="bash"><code>docker rm -f pgdemo
+docker volume rm pgdata
+docker volume create pgrestore
+docker run --rm -v pgrestore:/to -v "${PWD}:/from" alpine tar xzf /from/pgdata-backup.tar.gz -C /to</code></pre>
+        <p class="cmd-note">前两条把原容器和原卷彻底删掉——此刻数据只存在于那个 tar 文件里，这是整个演练中唯一有风险的瞬间，也正因如此必须做一次。第三条创建新卷 <code>pgrestore</code>。第四条把角色对调：tar 文件所在目录挂到 <code>/from</code>，新卷挂到 <code>/to</code>，用 <code>tar xzf</code> 解压并 <code>-C /to</code> 落地。注意这里用了 <code>x</code>（解压）而不是 <code>c</code>（创建），且 <code>-C</code> 依然在，所以内容会正确地落进空卷的根。</p>
+
+        <p>第五步，验证恢复结果。用一个新容器挂上新卷，把数据查出来。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name pgrestored -e POSTGRES_PASSWORD=secret -v pgrestore:/var/lib/postgresql/data postgres:16
+Start-Sleep -Seconds 15
+docker exec pgrestored psql -U postgres -c "SELECT * FROM notes;"</code></pre>
+        <p class="cmd-note">第一条启动新容器，挂的是恢复出来的卷。第二条是 PowerShell 的等待命令，给 Postgres 一点启动时间——你也可以用 <code>docker logs</code> 观察它打出 <code>database system is ready to accept connections</code> 再继续。第三条查询，你应该看到和备份前一模一样的那一行记录。<strong>看到它出现的那一刻，你才第一次真正拥有了一个备份，而不是一个希望。</strong></p>
+
+        <p>第六步，清理，以及把流程封装成你随时可以重跑的东西。</p>
+
+        <pre data-lang="bash"><code>docker rm -f pgrestored
+docker volume rm pgrestore
+docker images --format "{{.Repository}}:{{.Tag}}" | Select-String alpine</code></pre>
+        <p class="cmd-note">前两条清掉验证用的容器与卷。第三条演示一个组合：<code>docker images</code> 用 <code>--format</code> 只输出仓库名与标签，再交给 PowerShell 的 <code>Select-String</code> 过滤。这种"用 Docker 命令的格式化输出 + PowerShell 管道"的组合，是你在 Windows 上做批量运维时的常用手法，比在宿主机上装一堆 Linux 小工具要省事。</p>
+
+        <p>到这里你已经完整走了一遍。接下来讲两个进阶细节，它们决定了这套流程能不能用在真实项目上。</p>
+
+        <p>细节一：<strong>热备份的一致性。</strong> 上面我们是先停掉容器再备份吗？不是，我们是直接备份的（容器 <code>pgdemo</code> 在备份时还在运行）。对 Postgres 来说这样做的风险是可能抓到一个处于写入中间状态的快照，恢复后需要走一次崩溃恢复，通常能自愈，但业务量大的库可能需要真正的在线备份工具（<code>pg_basebackup</code>、<code>pg_dump</code>）。更重要的一条纪律是：<strong>对于正在被写入的有状态服务，先停容器再备份，或者用服务自己的备份工具，比用 tar 直接拷数据目录更可靠。</strong> tar 是通用的兜底手段，不是所有数据库的最佳手段。这个区别在第 12 章讲有状态服务时会正式展开。</p>
+
+        <p>细节二：<strong>把卷迁移到另一台机器。</strong> 迁移的本质就是"备份 + 传输 + 恢复"三步。备份出来的 tar 文件在你这台机器的当前目录里，它是一个普通文件，你可以用任何方式搬走：拷到 U 盘、传网盘、提交到对象存储、<code>scp</code> 到服务器。到了目标机器上，把文件放好，然后执行上面第三步之后的所有命令即可——新机器上不需要有原来的卷名，甚至不需要有原来的容器名。<strong>这就是数据卷的迁移优势：它把"一份数据"变成了"一个文件"，而文件是可以被任何工具搬运的。</strong> 相比之下，绑定挂载的数据迁移要你自己搞清楚"到底哪些文件算数据"，往往更麻烦，因为它和源码、配置、临时文件混在同一个目录里。</p>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>请为你的每一个"重要的卷"建立一条<strong>恢复演练</strong>的纪律，哪怕它只是一个课程设计。具体做法：在项目文档里写下一个固定的验证命令——通常是"从备份恢复到临时卷，起一个临时容器执行一次查询，把结果贴在这里"。然后在你每次改动数据结构或者升级数据库大版本之后，重跑一次。这和软件工程里的自动化测试是同一个逻辑：<strong>你不是为了证明自己写对了才测试，你是为了在出错时知道自己在哪一步错了。</strong> 备份也一样，它的价值不在文件存在，而在"我曾经成功地用它恢复过一次"这个事实。</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol start="7">
+            <li>如果只能保证一个，你选"每天备份一次但从未验证过能否恢复"，还是"每周备份一次且每次都在临时环境恢复验证过"？请说出你的选择依据，并指出这个选择在什么前提下会翻转。<span class="sub">提示：想清楚"没验证过的备份"在概率上到底等于什么。</span></li>
+            <li>为什么备份要恢复到一个<strong>新的</strong>卷名，而不是恢复回原来的卷？如果不删原卷直接覆盖恢复，可能出现什么更坏的情况？<span class="sub">提示：考虑"部分覆盖"——一半新数据一半旧数据的混合状态。</span></li>
+            <li>用 <code>tar</code> 直接打包一个正在运行的数据库的数据目录，为什么可能得到一份"看起来完整、实际不可用"的备份？请从"一份数据在磁盘上不是原子写入"这个角度解释。<span class="sub">提示：数据库写日志和数据文件有先后顺序，这是它有崩溃恢复能力的原因。</span></li>
+          </ol>
+        </div>
+
+        <h2 id="s8">把数据库放进容器：正确姿势，以及"改了密码为什么没生效"</h2>
+
+        <p>数据这一章最终总要面对那个最有代表性的有状态服务：数据库。关于"数据库能不能容器化"，你在网上会看到两种截然相反的说法，而它们都不准确。说"数据库不该进容器"的人，往往指的是"不该用无状态的思路去运维有状态的系统"——这个提醒是对的，但结论下错了：把数据库放进容器、把数据挂到卷上，已经是今天极其常见的做法，从本地开发、CI 测试环境到大量生产部署都在这么干。说"数据库随便容器化"的人，忽略的是有状态服务那一整套额外要求：备份、升级路径、资源保障、单点问题。</p>
+
+        <p>先建起正确的姿势。一条典型的、你在本机开发时应该使用的命令：</p>
+
+        <pre data-lang="bash"><code>docker volume create pgdata
+docker run -d --name pgdemo -e POSTGRES_PASSWORD=secret -p 5432:5432 -v pgdata:/var/lib/postgresql/data --restart unless-stopped postgres:16</code></pre>
+        <p class="cmd-note">逐个参数看：<code>-e POSTGRES_PASSWORD=secret</code> 通过环境变量告诉镜像初始密码（后面细讲它的作用范围）；<code>-p 5432:5432</code> 把数据库端口发布到宿主机，这样你在 Windows 上可以用图形化客户端连它；<code>-v pgdata:/var/lib/postgresql/data</code> 把数据目录挂到命名卷，这是本节的核心；<code>--restart unless-stopped</code> 让它在重启后自动拉起，但你手动停掉时不会被强行复活。第 04 章讲过 <code>--restart</code> 的四种取值，这里用的是生产与开发都最常见的那个。</p>
+
+        <p>现在讲那个经典困惑。你照上面跑了第一次，一切正常。过了一周，你觉得密码太弱，重新执行了同一条命令但把密码改成 <code>newsecret</code>，然后发现——新密码登录不了，旧密码还能用。</p>
+
+        <p>原因是我们上一节讲过的那条链。Postgres 官方镜像的入口脚本逻辑大致是：<strong>检查数据目录是否为空；如果为空，说明这是第一次启动，于是执行初始化——创建数据库集群、创建超级用户、并把 <code>POSTGRES_PASSWORD</code> 这个环境变量的值作为初始密码写进去；如果数据目录非空，则完全跳过初始化，直接启动数据库。</strong> 你的数据目录里已经有数据了，所以第二次启动时，那个 <code>-e POSTGRES_PASSWORD=newsecret</code> 被彻底忽略。它没有报错，没有警告，环境变量确实传进了容器（<code>docker inspect</code> 能看到），只是没有任何代码去读它。</p>
+
+        <p>环境变量只在初始化那一次被使用，之后它就只是一条无人理睬的配置——而你已经换了密码的信念，建立在它"应该生效"这个假设上。<strong>改密码的正确做法只有一条：进数据库改，不要改启动参数。</strong> 两种写法，视你的熟悉程度选：</p>
+
+        <pre data-lang="bash"><code>docker exec pgdemo psql -U postgres -c "ALTER USER postgres WITH PASSWORD 'newsecret';"
+docker exec -it pgdemo psql -U postgres</code></pre>
+        <p class="cmd-note">第一条命令直接在容器里执行 SQL 改密码，立刻生效且持久，因为它写在数据目录里，会跟着卷一起活下来。这里没有加 <code>-it</code>，是为了让它能被原样复制粘贴执行；需要键盘交互时才加。第二条进入交互式 <code>psql</code>，你可以自己敲 <code>ALTER USER postgres WITH PASSWORD 'newsecret';</code> 然后 <code>\q</code> 退出——建议至少手动做一次，因为看着提示符 <code>postgres=#</code> 出现、敲一条 SQL 得到 <code>ALTER ROLE</code> 的回应，是理解"数据库是有状态的、它的状态在数据目录里"最直观的体验。</p>
+
+        <pre data-lang="bash"><code>docker exec pgdemo psql -U postgres -c "SELECT version();"
+docker exec pgdemo psql -U postgres -c "SHOW data_directory;"</code></pre>
+        <p class="cmd-note">第一条确认连上了哪个版本的服务端；第二条输出 <code>/var/lib/postgresql/data</code>，正是你挂载卷的那个路径。这两条命令合起来回答了一个关键问题：<strong>我的数据到底写在哪个目录里？</strong> 这个问题的答案，和"这个目录有没有挂在卷上"，共同决定了你的数据能否活过容器的死亡。请你养成对每一个有状态服务都问一遍这个问题的习惯：Redis 是 <code>/data</code>，MySQL 是 <code>/var/lib/mysql</code>，MongoDB 是 <code>/data/db</code>。它们各不相同，都必须查证，不能猜。</p>
+
+        <p>那么开发环境里，如果我确实想"重置一切、用新密码重新来一遍"呢？答案就是删卷，接受数据全丢。</p>
+
+        <pre data-lang="bash"><code>docker rm -f pgdemo
+docker volume rm pgdata
+docker system df -v</code></pre>
+        <p class="cmd-note">两条命令把容器和卷一起清掉，下一次启动就是全新的初始化。第三条让你确认卷真的没了。<strong>请把这个动作命名为"重置"，并在心里给它贴一个警告标签——它是开发环境的特权，在生产环境里等同于"清库跑路"。</strong> 区分"重置"与"迁移"是数据管理意识成熟的标志：重置是接受丢失，迁移是保全数据。</p>
+
+        <p>现在把有状态服务的清单补齐。前面讲的是"数据放哪"，但让一个数据库在容器里长期可靠地跑，还要处理四件事，每一件都可能成为你日后翻车的现场。</p>
+
+        <p>第一件是<strong>备份</strong>。你已经在上一节练过了。要注意的是数据库的备份有自己的最佳实践（逻辑备份 <code>pg_dump</code> 与物理备份 <code>pg_basebackup</code> 解决不同问题），tar 打卷只是通用兜底。请在项目里明确写上"备份用哪种方式、多久一次、存在哪、谁负责验证"。</p>
+
+        <p>第二件是<strong>升级路径</strong>。数据库大版本升级通常不能靠"换一个新镜像标签然后重启"完成。Postgres 的 15 到 16 需要 <code>pg_upgrade</code> 或导出导入，MySQL 跨大版本也常有兼容要求。容器让"换版本"看起来只是一个标签的事，这个错觉很危险。<strong>正确做法是把升级当成一次有预案的数据迁移：备份 → 在临时环境演练 → 记录耗时与回滚方式 → 再动生产。</strong></p>
+
+        <p>第三件是<strong>资源保障</strong>。数据库对内存和 IO 很敏感。在容器里它默认可以使用整台机器的资源，和你的其他容器抢。第 04 章讲过 <code>-m</code> 与 <code>--cpus</code>，这里要补一句数据库特有的坑：给数据库容器设内存上限之后，数据库自己的缓存配置（Postgres 的 <code>shared_buffers</code>、MySQL 的缓冲池）必须跟着调小，否则会出现"容器内存超限被杀、退出码 137"的现象，而日志在死前毫无征兆。</p>
+
+        <p>第四件是<strong>单点问题</strong>。"我只跑了一个数据库容器"意味着它挂了服务就断了。这在本地开发完全可接受，在生产就必须面对。做高可用需要主从复制、故障切换、一致性权衡——这是第 12 章要展开的集群有状态难题。现在你只需要知道它存在，并且知道它为什么难：<strong>难在"身份"</strong>。一个无状态服务的任何一个副本都等价，可以随便替换；而一个数据库实例，它有一个名字、一个地址、一份独有的数据、一个主从角色。你能复制一个容器，但你不能复制一个数据库实例的身份。</p>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>第 12 章会正面回答"为什么集群里最难的总是有状态服务"。到那时你会看到 Kubernetes 为这类工作负载单独准备了一整套抽象：给每个实例稳定身份、稳定网络标识、独立存储的机制，以及它们带来的复杂度。今天你需要带走的判断是：<strong>无状态服务可以随时替换，有状态服务必须被"认出来"。</strong> 身份不可随意替换，正是有状态服务一切复杂度的源头，也是为什么"把数据库放进容器"和"让数据库在集群里可靠运行"是两个难度完全不同的问题。</p>
+        </div>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 04 章讲命令时提到过 <code>docker rm -v</code> 与 <code>docker system prune --volumes</code>，当时只是提了一句"删卷要当心"。现在你知道那句提醒的分量了：它们删掉的是本节这一整条链上最脆弱的一环——那个装着你的业务数据的卷。第 05 章讲 Dockerfile 时，我们只用一句话带过了 <code>VOLUME</code> 指令，现在你知道它做什么了：它声明"这个目录里的内容属于数据而不是程序"，并让 Docker 自动为你准备一个匿名卷。第 03 章的写时复制，在本章第一节变成了具体的性能数字与磁盘占用。</p>
+        </div>
+
+        <details>
+          <summary>展开：为什么"数据库不能被容器化"这个说法会出现，又错在哪里</summary>
+          <p>这个说法的历史根源很实在。容器刚流行时，很多人把它当成"更轻的虚拟机"，于是把数据库照搬进去、数据留在可写层、没有备份、没有资源限制，宿主机重启数据就蒸发，然后得出了"容器不适合跑数据库"的结论。这个结论其实是对<strong>错误用法</strong>的正确总结。</p>
+          <p>它错在把"工具的默认行为"当成了"工具的能力边界"。容器的默认行为确实对数据不友好——可写层会随容器消失、默认没有资源上限、默认以 root 跑。但这些都是<strong>默认值</strong>，是可以被显式配置改变的：挂上卷、设 <code>-m</code> 与 <code>--cpus</code>、用非 root 用户、配备份与监控。把默认值当边界，是技术判断中最常见的一类错误。</p>
+          <p>反过来说，"数据库容器化很简单"也不对。它的复杂度从"安装配置"转移到了"数据生命周期管理"：备份、升级、迁移、容量、故障恢复、跨机器的一致性。这些工作本来也存在，容器只是把它们从"你的运维手册藏在脑子里"变成了"必须写下来、必须可复现"。对个人项目这是负担，对团队这是收益。</p>
+        </details>
+
+        <h2 id="s9">数据生命周期：把每一份数据放进它该去的那一类</h2>
+
+        <p>这一章讲了很多具体的技术细节，但真正要交付给你的是一套判断力。它的形态是把一个项目里所有的数据分成三类，然后为每一类确定"放在哪、备不备、留多久"。这个动作只需要十分钟，却能避免你在半年后面对一个无法回答的问题："这个卷里是什么？能删吗？"</p>
+
+        <p>第一类是<strong>可丢弃的临时数据</strong>。判断标准是"删掉之后，系统重新构造它需要多长时间，以及会不会有人因此损失什么"。编译中间产物、依赖缓存、缩略图、会话临时文件、容器内的临时目录，都属于这一类。它们的正确位置是：能放内存就放内存（tmpfs），否则放容器可写层或匿名卷，随容器一起消失最好。它们的备份策略是"不备份"，保留策略是"越短越好"。很多人对这类数据过于珍惜，结果是磁盘被一堆可以随时重建的东西占满。</p>
+
+        <p>第二类是<strong>需要持久化的业务数据</strong>。判断标准是"删掉之后，用户会损失信息或服务会失效，但它可以被重新生成或重新采集"。上传的图片与文档、用户的草稿、模型权重与训练检查点、不承担审计责任的日志、缓存以外的应用状态，属于这一类。它们应该放在数据卷里，需要有定期备份，需要明确保留窗口（比如"保留最近 30 天"）。这类的关键在于：<strong>它重要，但它不是唯一副本</strong>——原始素材可能还在用户的手机里，模型可以从数据与代码重新训练，只要你能接受时间成本。</p>
+
+        <p>第三类是<strong>必须被备份与审计的关键数据</strong>。判断标准是"删掉之后，你无法重建、且可能需要向别人举证"。交易记录、订单、成绩、财务凭证、实验原始数据、合规要求的日志，属于这一类。它们不仅要放卷，还应该有独立的备份策略（多副本、异地、不同介质）、明确的保留期限（可能是法定年限）、访问审计，以及——这条最容易被忽视——<strong>定期验证可恢复性</strong>。这三类数据的管理强度差着数量级，而把它们混在一起处理的代价是：要么把可丢弃数据当宝贝管（浪费时间），要么把关键数据当缓存扔（后果严重）。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>数据类别</th><th>判断标准</th><th>放在哪里</th><th>备份与保留</th><th>典型例子</th></tr></thead>
+            <tbody>
+              <tr><td>可丢弃的临时数据</td><td>删掉后能自动重建，无人受损</td><td>tmpfs、容器可写层、匿名卷</td><td>不备份，随容器消失</td><td>构建缓存、缩略图、会话临时文件、包管理器缓存</td></tr>
+              <tr><td>需持久化的业务数据</td><td>删掉会损失信息，但可重新生成</td><td>命名数据卷，可读写</td><td>定期备份，保留 30 天这类窗口</td><td>用户上传的文件、草稿、模型检查点、普通日志</td></tr>
+              <tr><td>需备份与审计的关键数据</td><td>删掉不可重建，可能需要举证</td><td>命名数据卷 + 独立备份通道</td><td>多副本、异地、可恢复性定期验证、法定保留期</td><td>订单与交易记录、成绩、实验原始数据、合规日志</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>这张表看起来简单，但要真正用起来，你需要能够对任意一份数据快速做出判断。下面给你四条判断问句，按顺序问，第一个答"是"的就决定了它的类别。</p>
+
+        <p>第一问："如果这份数据永久消失，有没有人（包括未来的你）会受到实际伤害？"如果没有任何人受损，它是第一类。第二问："如果它消失，我能不能在不损失信息的前提下重建它？"如果能（哪怕要跑几小时），它是第二类。第三问："如果我需要向老师、同事、客户、监管证明某件事发生过，这份数据是不是证据？"如果是，它至少是第三类。第四问："这份数据里有没有别人的个人信息？"如果答案是"有"，它自动升格为第三类处理——因为这里的成本不只是数据丢失，还包括法律与信任。</p>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>把分类写成项目文档的一部分，而不是留在脑子里。具体形式可以极其简单：在项目根目录放一个 <code>DATA.md</code>，画一张表，三列——数据是什么、属于哪一类、用什么命令备份与恢复。这份文档的价值在于它必须在<strong>写代码之前</strong>被写出来，因为写它的时候你会被迫回答"这个功能产生的数据，删了会怎样"。你会惊讶地发现，很多设计分歧其实是数据分类分歧：一个人认为会话数据可以随便丢，另一个人认为必须持久化，而两个人的产品需求可能根本不同。<strong>先把数据的生命周期写清楚，容器与存储的技术选择往往就自动确定了。</strong> 这是一种典型的"先想清楚再动手"，也是本手册一直在训练你的东西。</p>
+        </div>
+
+        <p>现在回答本章最后那个悬念。前面我说过：找五个容器，说出每个容器里最重要的数据在哪、属于哪一类、删掉容器后它是否还在。这个练习的难点从来不是技术，而是"重要"这个词的歧义。一个有经验的工程师会用三层筛子过一遍所有数据：先按"谁拥有它"分（应用代码、配置、用户数据、系统缓存），再按"谁负责它"分（谁写它、谁读它、谁清理它），最后按"它出问题时的爆炸半径"分（只影响自己、影响一个功能、影响全部用户）。三层筛完，你会发现要真正认真对待的数据比想象中少得多，而这少数几份数据的处理方式也更加明确。这就是"给每一份数据指明一个负责人"的思路——它比任何备份软件都更能防止数据事故。请你在自己的下一个项目上真的做一次。</p>
+
+        <h3 id="s9-1">动手实验：给你的课程设计做一次数据体检</h3>
+
+        <p>实验目的是把本章所有知识串成一个可交付的动作。假设你有一个用容器跑着的课程设计项目，按下面的顺序检查一遍。</p>
+
+        <pre data-lang="bash"><code>docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+docker inspect -f "{{.Name}} -> {{json .Mounts}}" 容器名
+docker system df -v</code></pre>
+        <p class="cmd-note">第一条列出所有运行中的容器与它们的镜像和状态，这是你"项目的全貌"。第二条针对每一个容器，打印它挂了什么：<code>Type</code> 告诉你卷还是绑定挂载，<code>Source</code> 告诉你数据真实落在哪里，<code>Destination</code> 告诉你容器里哪个目录。<code>docker system df -v</code> 给出全局的空间账本。把这三条的输出抄进 <code>DATA.md</code>，你就有了第一版数据清单。</p>
+
+        <p>然后针对清单里的每一份数据回答三个问题：它属于三类中的哪一类？如果现在删掉它，会发生什么？它上一次被成功恢复验证是什么时候？这三个问题的答案如果有一个是"不知道"，那份数据就是你现在最该处理的对象。追问一个变体：如果你的笔记本明天坏了，你项目里有哪些数据会永久丢失？请诚实回答，然后决定要不要为此做点什么。</p>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol start="10">
+            <li>一个容器里的数据"可以随便删"，这个判断应该由谁做出？是写代码的人、部署的人、还是数据的所有者？如果三方答案不一致，会出什么事？<span class="sub">提示：想想"共享盘上谁都不敢删的那个文件夹"是怎么形成的。</span></li>
+            <li>你如何判断一个容器的数据属于本章三类中的哪一类？请给出一个具体的、可执行的检查动作，而不只是一个判断标准。<span class="sub">提示：判断标准可以是问句，但检查动作必须是你能在终端里做出来的事情。</span></li>
+            <li>把日志归入"可丢弃"和归入"需审计"这两类，会导致什么样的架构差异？请从"日志写在哪、保留多久、谁能读"三个角度对比。<span class="sub">提示：审计日志的核心要求不是"存下来"，而是"不会被改写"。</span></li>
+          </ol>
+        </div>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 01 章讲容器要解决的四个古老问题时，"交付物模糊"与"服务器迁移的噩梦"是其中两个。本章给这两个问题补上了它们最容易被忽略的一半：迁移一台服务器，难点不只是搬应用，更是搬数据。你把镜像推送到仓库、在新机器上 <code>docker run</code>，应用几秒钟就起来了；而数据要么通过卷的 tar 文件搬过去，要么就在新旧两台机器之间形成一道永久的裂缝。这就是为什么"可复现"这个词在本手册里出现得如此频繁——它不只针对代码，也针对数据。</p>
+        </div>
+
+        <!-- ===================== 章末 ===================== -->
+        <h2 id="selfcheck">自测：检验你是否真的学懂了</h2>
+        <div class="block check">
+          <span class="bt">检 查 题</span>
+          <ol>
+            <li>请解释"容器里能写文件"与"数据安全"为什么是两件不同的事，并指出可写层在什么时刻必然消失。
+              <details><summary>参考答案</summary><p>可写层是每个容器独有的一层，位于只读镜像层之上，由联合文件系统把它们合并成容器看到的根文件系统。它能写，所以进程在容器里创建、修改、删除文件都正常。但它的生命周期和容器对象绑死：<code>docker rm</code> 容器时它一并被清理。所以"能写"描述的是本次运行期间路径可读可写，"数据安全"要求的是内容在下一个容器、下一台机器、下个月依然存在且一致——这是两个层次的命题。要拿到后者，必须把数据放到容器生命周期之外，也就是卷、绑定挂载或外部服务。<strong>评分要点：说出可写层与容器同生共死、说出持久化需要在容器之外。</strong></p></details>
+            </li>
+            <li>为什么在可写层里改一个 8 GB 的数据库数据文件会明显变慢，而改一个 2 KB 的配置文件几乎无感？请说出机制的名字。
+              <details><summary>参考答案</summary><p>机制是写时复制（Copy-on-Write，CoW）。第一次写入一个来自只读层的文件时，内核会把整个文件完整复制到可写层，修改发生在副本上；代价由文件大小决定，而不是由你改动的字节数决定。8 GB 的文件要复制 8 GB，产生秒级以上停顿和大量额外磁盘占用；2 KB 的文件复制 2 KB，几乎察觉不到。这也解释了为什么删除镜像里的大文件不省空间：那只在可写层写了一个白障标记，下层文件依然存在。相关术语还有写放大。</p></details>
+            </li>
+            <li>命令预测：<code>docker run --rm -v mydata:/app alpine ls /app</code> 之后，下面哪条命令能看到 <code>mydata</code> 里的内容？A. <code>ls ./mydata</code>（在当前目录） B. <code>docker volume inspect mydata</code> 里 <code>Mountpoint</code> 指向的路径 C. 都看不到 D. 两者都能看到。
+              <details><summary>参考答案</summary><p>答案是 B（前提是你在引擎所在的文件系统里访问，Linux 上直接可以，Windows 上需要进 WSL）。<code>-v mydata:/app</code> 的源是<strong>命名卷</strong>，不是路径，因为 <code>mydata</code> 不以 <code>.</code> 或 <code>/</code> 开头。卷的数据在 Docker 的数据目录里，不在你的当前目录，所以 A 看不到。<code>docker volume inspect</code> 的 <code>Mountpoint</code> 字段会给出真实路径。如果你把命令写成 <code>-v ./mydata:/app</code>，答案就变成 A 了——这正是本章强调的那个两字符陷阱。</p></details>
+            </li>
+            <li>故障诊断：同学说他用 <code>-v ./data:/var/lib/postgresql/data</code> 跑了数据库，重启电脑后数据全没了。请列出至少三种可能的原因，并给出各自的验证方法。
+              <details><summary>参考答案</summary><p>可能原因一：他每次都在不同的工作目录下启动容器，于是 <code>./data</code> 指向了不同的宿主机目录，实际上是新建了一个空目录挂进去。验证：<code>docker inspect -f "{{json .Mounts}}" 容器名</code> 看 <code>Source</code> 的具体路径，和上一次比较。<br>可能原因二：他用了 <code>docker run --rm</code> 或某种清理脚本，同时容器被重新创建，而绑定挂载的目录从未真正写入过数据（比如数据库因为权限问题初始化失败）。验证：<code>docker logs</code> 看启动时是否报错。<br>可能原因三：<code>./data</code> 这个相对路径被 Docker Desktop 翻译到了别的地方，而他一直在另一个目录下找。验证：直接进那个 <code>Source</code> 目录看有没有文件。<br>可能原因四：他其实没有挂载成功，数据一直写在可写层里。验证：<code>docker inspect</code> 看不到 Mounts 条目，或者 <code>Type</code> 不是 <code>bind</code>。<strong>评分要点：给出可验证的检查动作，而不是只给猜测。</strong></p></details>
+            </li>
+            <li>为什么把宿主机的空目录挂到容器的 <code>/app</code> 之后，镜像里原本装好的 <code>node_modules</code> 就不见了？这不是应该"合并"吗？
+              <details><summary>参考答案</summary><p>挂载的语义是<strong>替换</strong>而不是合并：挂载点 <code>/app</code> 这个目录的视图被挂载源目录的内容整体覆盖，容器里原本该目录下的内容就被遮住了。这在联合文件系统的视角下完全一致——挂载点是一个新的、优先展示的层。所以镜像里 <code>COPY</code> 进去的依赖不会与新挂上的目录叠加。两种常见解法：容器启动后重新安装依赖（干净但慢），或者把依赖目录用另一个卷单独挂载，让它不受源码挂载影响（快但要管理多个卷）。第 08 章会把第二种做法写成 Compose 里的标准形态。</p></details>
+            </li>
+            <li>现象解释：你用只读挂载把一个卷挂到 nginx 的 <code>/usr/share/nginx/html</code>，第一次启动时里面居然有内容（一张 nginx 的默认欢迎页）。这些文件是哪来的？如果重开一个新容器，还会有吗？
+              <details><summary>参考答案</summary><p>这些文件来自镜像：当空卷挂载到容器内一个原本非空的目录时，Docker 会把镜像里该目录的内容复制进卷，只复制这一次。所以第一次启动时卷里就有了默认欢迎页。重开一个新容器时，如果挂的还是同一个卷，卷已经非空，Docker 不会再做复制，容器看到的就是卷里此刻的内容——你后来改过、删过的东西是什么样，它就是什么样。这就是"改了镜像但容器里没变"的根源。想复原，只能删卷重建，或者改成绑定挂载单个文件。</p></details>
+            </li>
+            <li>命令预测：先执行 <code>docker run -d --name a1 -e POSTGRES_PASSWORD=x postgres:16</code>，再执行 <code>docker rm a1</code>。此时 <code>docker volume ls --filter dangling=true</code> 会输出什么？如果把第二条命令换成 <code>docker rm -v a1</code> 呢？
+              <details><summary>参考答案</summary><p>第一次：会看到一个 64 位十六进制 ID 的匿名卷。因为 postgres 镜像声明了 <code>VOLUME</code>，即使你没写 <code>-v</code>，Docker 也自动创建了一个匿名卷来装数据目录；而 <code>docker rm</code> 默认不动卷。第二次：<code>-v</code> 会让匿名卷随容器一起删除，所以列表里不再有这个卷。<strong>但要记住 <code>-v</code> 的精确语义是"删匿名卷"，它不删命名卷</strong>——你给卷起了名字，Docker 就认为你想留着它。这个区别是很多人误操作的来源。</p></details>
+            </li>
+            <li>方案取舍：一个 500 GB 的图像数据集要给训练容器只读使用，你选数据卷还是绑定挂载？请说明理由，并说清代价。
+              <details><summary>参考答案</summary><p>选绑定挂载，且以只读方式挂（<code>--mount type=bind,source=...,target=/data,readonly</code>）。理由是数据卷的"初始化复制"和"由 Docker 管理"这两件事在这里都变成负担：500 GB 没有理由再复制一份，而且这个数据集通常还要被宿主机的其他工具（标注脚本、rsync 同步、独立的分析程序）直接访问，绕过 Docker 更方便。代价是配置依赖宿主机路径、跨机器迁移时要自己保证路径一致、以及必须小心不要误挂成可写（训练脚本写坏原始数据集是不可接受的）。反向情形：如果数据只有几百 MB 且必须跟随镜像的部署一起走，数据卷更合适。</p></details>
+            </li>
+            <li>故障诊断：你的 Python 容器在 Windows 上挂载项目源码后，改了代码但服务不自动重载。<code>docker exec</code> 进去 <code>cat</code> 那个文件，发现内容<strong>已经更新了</strong>。这说明什么？接下来你会怎么做？
+              <details><summary>参考答案</summary><p>这说明挂载本身是正常的（内容同步没问题），失效的是<strong>文件变更通知</strong>：容器里的进程没有收到"文件变了"这个事件，因此没有触发重载。这就是 Windows 盘符挂载到 WSL2 容器时的典型现象，事件在跨虚拟机边界时丢失。<br>可选动作有三类：把项目搬到 WSL 文件系统内再挂载（根治，代价是路径变成 UNC 形式）；开启开发服务器的轮询模式（改动小，代价是 CPU 占用与响应延迟）；放弃热重载，改完手动重启容器（最稳，代价是开发循环变长）。<strong>关键判断是要能区分"内容没同步"与"通知没送达"这两类不同的问题，它们的修法完全不同。</strong></p></details>
+            </li>
+            <li>现象解释：你备份了一个卷，tar 文件有 120 MB，看起来一切正常。三个月后你需要恢复，解压后发现数据库启动不了。请给出至少两个可能的原因。
+              <details><summary>参考答案</summary><p>原因一：备份时数据库正在运行，tar 抓到了一个写入中间状态的快照。数据文件与预写日志（WAL）之间不自洽，某些情况下无法完成崩溃恢复。这正是"备份成功不等于可恢复"的典型例子。验证方式是在备份时先停容器，或者使用数据库自己的备份工具。<br>原因二：备份时路径写错，打包的其实是空目录或者只有一部分内容，只是文件大小看起来合理（比如只打包了日志文件）。验证方式是 <code>tar tzf</code> 列表检查、以及做一次真实的恢复演练。<br>原因三：恢复时 <code>-C</code> 用错或用了解压到错误层级，导致文件散落在卷根之外；或者恢复前后数据库大版本不一致。<strong>核心观点：任何未经恢复演练的备份都只是信念。</strong></p></details>
+            </li>
+            <li>动手任务：写出把命名卷 <code>appdata</code> 备份到当前目录、然后恢复到一个叫 <code>appdata-restore</code> 的新卷的完整命令，并指出哪一步你必须先确认成功。
+              <details><summary>参考答案</summary><p>备份：<code>docker run --rm -v appdata:/from -v "${PWD}:/to" alpine tar czf /to/appdata.tar.gz -C /from .</code><br>创建新卷：<code>docker volume create appdata-restore</code><br>恢复：<code>docker run --rm -v appdata-restore:/to -v "${PWD}:/from" alpine tar xzf /from/appdata.tar.gz -C /to</code><br>必须确认的是备份文件本身有效：用 <code>tar tzf</code> 列出内容并核对关键文件是否存在、文件大小是否合理。这一步不做，后面的恢复就是在赌。<code>-C</code> 与结尾的 <code>.</code> 保证了压缩包内路径是相对的，两处都不能省。</p></details>
+            </li>
+            <li>方案取舍：有人主张"数据库绝对不该放进容器"，也有人主张"什么都能容器化"。请指出两种说法各自抓住了什么真实的东西，又各自错在哪里。
+              <details><summary>参考答案</summary><p>第一种说法抓住的真实问题：容器的默认行为对数据非常不友好——可写层随容器消失、默认无资源上限、默认以 root 运行、清理命令容易误删卷。用错默认值确实会丢数据。它错在把<strong>默认值</strong>当成了<strong>能力边界</strong>：这些都是可以显式配置改变的（挂卷、限资源、降权限、备份）。<br>第二种说法抓住的真实问题：把数据库放进容器在技术上完全可行，本地开发、CI、生产都有大量实践。它错在忽略了有状态服务的额外要求：备份、升级路径、资源保障、单点问题。复杂度并没有消失，它从"安装配置"转移到了"数据生命周期管理"。<strong>评分要点：能区分"默认行为"与"能力边界"。</strong></p></details>
+            </li>
+            <li>概念辨析：为什么我们说"你能复制一个容器，但不能复制一个数据库实例的身份"？请从名字、地址、数据、角色四个角度说明。
+              <details><summary>参考答案</summary><p>无状态服务的副本彼此等价，任何一个都能处理任何请求，所以"再起一个"就是扩容。数据库实例不一样：它有名字（客户端配置里写的就是它）、有地址（复制关系、备份脚本、监控都指向它）、有独有数据（不是可再生的，是唯一的真相来源）、有角色（主库还是从库，切换角色是一次严肃的状态变更）。所以"再起一个数据库容器"不会得到一个可替换的副本，只会得到一个新的、空的、需要单独初始化的实例。这就是有状态服务难以调度的根本原因，也是第 12 章集群有状态难题的入口。<strong>评分要点：指出"身份不可替换"。</strong></p></details>
+            </li>
+            <li>设计与判断：请为下面五份数据分别指定存放位置与管理强度，并说明理由——(1) 前端构建产生的 <code>dist</code> 目录；(2) 用户在网站上传的简历 PDF；(3) 应用的访问日志；(4) 训练了 8 小时得到的模型检查点；(5) 一个存放第三方 API 令牌的文件。
+              <details><summary>参考答案</summary><p>(1) 可丢弃类：放容器可写层或 tmpfs，构建结束就消亡，不备份。理由：可以从源码与依赖完全重建。<br>(2) 需持久化类：放命名数据卷，定期备份，保留窗口按业务定。理由：用户的东西丢了是信任损失，但用户手里可能有原文件。<br>(3) 取决于内容：普通访问日志属可丢弃或在第二类内保留短窗口；如果含合规要求（谁在什么时候访问了什么）就升格为第三类，要求不可篡改与法定保留期。<br>(4) 需持久化类，且备份要跟得上训练节奏（检查点通常按 epoch 写）。理由：重建成本是数小时 GPU 时间，可能无法完全复现。<br>(5) 属于绝不能落盘的一类，用只读挂载文件或 tmpfs 注入，不进镜像、不进 Git、不写环境变量。理由：它是权限本身，泄漏等于被冒用。</p></details>
+            </li>
+          </ol>
+        </div>
+
+        <h2 id="ask">自问自答：把知识压进长期记忆</h2>
+        <div class="block think">
+          <span class="bt">自 问 自 答</span>
+          <ol>
+            <li>合上页面，用自己的话讲一遍：容器里写一个文件，从系统调用到磁盘，中间经过了哪几个动作？<span class="sub">提示：打开、写时复制、落层、白障，按顺序讲。</span></li>
+            <li>为什么"数据要放卷里"这个建议不只关乎数据丢失，还关乎性能？把写放大的因果链讲给自己听。<span class="sub">提示：代价不由改动大小决定，由文件大小决定。</span></li>
+            <li>三种挂载方式的所有权分别属于谁？用一个你可以用来自查的问题把它们区分开。<span class="sub">提示：问"谁负责创建它、谁负责删掉它、谁负责备份它"。</span></li>
+            <li><code>-v mydata:/app</code> 与 <code>-v ./mydata:/app</code> 的差别，你能不看笔记说清楚吗？判断规则是什么？<span class="sub">提示：源的第一个字符。</span></li>
+            <li>空卷初始化语义是什么？请举出一个它导致"配置改了没生效"的真实场景，并说出三种解法。</li>
+            <li>匿名卷为什么被称为磁盘黑洞？它的产生条件、检查命令、两个不同的清理方式分别是什么？<span class="sub">提示：<code>docker rm -v</code> 与 <code>docker system prune --volumes</code> 的语义不同。</span></li>
+            <li>在 Windows 上挂载 Windows 目录进容器，有哪些代价？请说出三个变通方案以及各自的代价。</li>
+            <li>为什么"备份成功"必须用一次真实的恢复来证明？请说出一个只有恢复才能发现的备份缺陷。</li>
+            <li>数据库的初始密码环境变量为什么改了不起作用？正确的改密码方式是什么？还有哪一类配置具有这种"只在第一次生效"的性质？<span class="sub">提示：想想所有"初始化脚本"都在数据目录为空时运行这件事。</span></li>
+            <li>数据三分法的判断标准分别是什么？用你自己的项目举例，说出每一类里至少一份数据。<span class="sub">提示：如果答不出第三类，说明你还没找到项目里最需要保护的东西。</span></li>
+          </ol>
+        </div>
+
+        <h2 id="summary">本章总结</h2>
+        <ul>
+          <li>容器里能写文件，靠的是每个容器独有的可写层；可写层与容器同生共死，<code>docker rm</code> 的瞬间它一并消失，所以"能写"与"安全"是两件事。</li>
+          <li>写文件的完整路径是：先读只读层，首次写入时把整个文件复制到可写层，之后所有改动都叠加在上层；删除文件只是在可写层写一个白障标记，下层文件不动、空间也不释放。写放大的代价由文件大小而不是改动大小决定，所以"数据库数据目录放在可写层"不是一条经验口诀，而是一个可以从机制推导出来的错误。可写层还记在宿主机的虚拟磁盘上，用完不会自动归还。</li>
+          <li>数据卷、绑定挂载、tmpfs 的本质差异是所有权：Docker 管理并登记、宿主机直接管、还是内核放在内存里。所有权决定了路径形式、跨平台行为、备份方式与最大风险。</li>
+          <li>"开发用绑定挂载、生产用数据卷"成立，但它有三种应当被推翻的情形：数据必须由宿主机备份系统直接管理、挂载的是单个文件、数据大到复制没有意义。</li>
+          <li><code>-v</code> 紧凑但会沉默地替你决定，<code>--mount</code> 啰嗦但会明确地失败。绑定挂载的宿主机路径不存在时，<code>-v</code> 静默创建空目录，<code>--mount</code> 报错退出——在数据这件事上，响亮的失败远好过安静的错误。</li>
+          <li>空卷挂到非空目录时，Docker 会把镜像里那份内容复制进卷，且只复制一次。这个一次性、不可见的动作，是"改了镜像但容器里没变"这类困惑的根源。</li>
+          <li>匿名卷由 <code>VOLUME</code> 指令或不带卷名的挂载产生，删容器时默认留下；<code>docker rm -v</code> 只删匿名卷，<code>docker system prune --volumes</code> 会删掉所有未被使用的卷，包括你珍贵的命名卷。</li>
+          <li>Docker Desktop 在 Windows 上制造了一条虚拟机边界：挂载 Windows 目录的代价是文件操作变慢与 inotify 事件经常失效，解法有搬进 WSL、开启轮询、放弃热重载三种，各有代价。</li>
+          <li>数据卷的备份标准流程是"临时容器同时挂卷与宿主机目录，用 tar 打包"，恢复时必须落到一个新的卷名上，并且必须真的删掉原卷做一次演练。</li>
+          <li>备份是动作，可恢复性是性质；只有一次真实的恢复演练才能证明备份存在。正在被写入的数据库用 tar 直接拷贝可能得到不自洽的快照。</li>
+          <li>数据库初始化的密码环境变量只在数据目录为空时被读取一次，所以改密码要进数据库改（<code>ALTER USER</code>），而不是改启动参数；同类"只在第一次生效"的配置都要这样对待。</li>
+          <li>把数据分成可丢弃、需持久化、需备份与审计三类，并为每一类确定存放位置与管理强度——这一章最重要的一个判断是：<strong>数据的价值决定了它该承担多少管理成本，而不是反过来。</strong></li>
+        </ul>
+
+        <p>一只木箱真正被装满之后，你才会开始在意它的木板厚不厚、缝紧不紧。前面几章你学会了造箱子、把货装进去、把箱子运到别处，这一章你第一次认真看了一眼箱子里的东西该怎么放——哪些可以随手扔，哪些要垫在中间，哪些必须单独上一个锁。容器教会你的最重要的一课，也许不是"如何打包一个应用"，而是"如何分清什么会消失、什么不会"。带着这份分辨力往前走，你会发现后面每一章都在重复同一个动作：先问清楚"这个问题的边界在哪里"，再决定用什么工具。下一章我们换一个方向——箱子里的事安排好了，箱子与箱子之间要开始说话了。</p>
+
+        <h2 id="more">拓展：如果你想让这一章长得更深</h2>
+        <div class="block method">
+          <span class="bt">拓 展 阅 读</span>
+          <ul class="res-list">
+            <li>
+              <span class="rt">Docker 存储总览<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/engine/storage/" target="_blank" rel="noopener">https://docs.docker.com/engine/storage/</a>
+              <span class="rd">这一页是本章内容的地图，不长，但它把卷、绑定挂载、tmpfs 并列摆在一起，并且明确给出"什么场景选哪个"的官方建议。带着一个具体问题去读：我下周的项目里，数据库数据、源码、密钥分别该用哪一种？读完你应该能自己回答，而不需要回来翻本章。</span>
+            </li>
+            <li>
+              <span class="rt">数据卷<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/engine/storage/volumes/" target="_blank" rel="noopener">https://docs.docker.com/engine/storage/volumes/</a>
+              <span class="rd">重点读三部分：卷的创建与命名、<code>--mount</code> 与 <code>-v</code> 的对照说明（官方自己也在这一页比较了两者）、以及"用卷备份恢复与迁移"的那一节。它的备份示例用的是 <code>--volumes-from</code> 加上宿主机目录挂载的写法，和我们本章用两个 <code>-v</code> 的写法是同一件事的两种表达，对照着看能加深理解。</span>
+            </li>
+            <li>
+              <span class="rt">绑定挂载<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/engine/storage/bind-mounts/" target="_blank" rel="noopener">https://docs.docker.com/engine/storage/bind-mounts/</a>
+              <span class="rd">这一页最值得读的是"挂载到容器上的文件或目录被覆盖"以及权限相关的段落。它会让你看到绑定挂载在宿主机上不存在路径时的行为差异，也会提醒你一个本章没展开的坑：容器里的用户 ID 与宿主机用户 ID 不一致时的写入权限问题。带着"我以非 root 用户运行容器时，为什么写不进去"这个问题去读。</span>
+            </li>
+            <li>
+              <span class="rt">清理磁盘空间<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/config/pruning/" target="_blank" rel="noopener">https://docs.docker.com/config/pruning/</a>
+              <span class="rd">把这一页当成一张危险操作清单来读，重点看每个 <code>prune</code> 子命令会删掉什么、<code>-a</code> 与 <code>--volumes</code> 分别扩大了多少范围。读完请你在自己的机器上先跑 <code>docker system df -v</code>，把卷那一栏的清单抄下来，再决定要不要执行任何清理命令。这一页的价值不在于教你清理，而在于教你分清"可以清理"与"不可恢复"。</span>
+            </li>
+            <li>
+              <span class="rt">十二要素应用<span class="tag">方法论</span></span>
+              <a class="ru plain" href="https://12factor.net/zh_cn/" target="_blank" rel="noopener">https://12factor.net/zh_cn/</a>
+              <span class="rd">中文版全文很短，请专挑两节读："进程"与"后端服务"。前者讲"应用应该以无状态进程运行，任何需要持久化的数据都交给后端服务"，这正好是本章的理论底盘；后者讲数据库这类后端资源应该被当作可替换的附加资源来对待。读完再回头看本章的数据库那一节，你会有一种"原来这里有一条更大的原则"的感觉。</span>
+            </li>
+            <li>
+              <span class="rt">Compose 示例合集<span class="tag">代码仓库</span></span>
+              <a class="ru plain" href="https://github.com/docker/awesome-compose" target="_blank" rel="noopener">https://github.com/docker/awesome-compose</a>
+              <span class="rd">官方维护的一批可运行示例。请挑一个带数据库的示例（比如 Django + Postgres 或 Node + Mongo），只看它的 compose 文件里卷与绑定挂载是怎么写的，然后逐条问自己：为什么这一项用卷、那一项用绑定挂载？哪一项如果换成另一种会出什么问题？这是把本章的取舍准则放到真实配置里验证的最好练习场，也是第 08 章的预热。</span>
+            </li>
+          </ul>
+        </div>
+        <div class="block method">
+          <span class="bt">值 得 品 读 的 书</span>
+          <ul class="booklist">
+            <li>
+              <span class="bn">《Docker 实战》</span> <span class="ba">Jeff Nickoloff 著</span>
+              <span class="bw">这本书对层、卷与存储的讲解是同类书里最扎实的，它会把卷的挂载点、生命周期、以及与宿主机文件系统的关系讲到底层。适合在你已经能跑通本章所有命令之后读它的存储章节，带着一个具体问题去读：为什么卷的抽象要设计成这样，它替我们挡住了哪些复杂的实现细节？</span>
+            </li>
+            <li>
+              <span class="bn">《深入浅出 Docker》</span> <span class="ba">Nigel Poulton 著</span>
+              <span class="bw">薄、图多、讲得清，最适合零基础建立整体图像。请优先读它的容器与数据相关章节，它擅长用图示把"镜像只读、容器多一层可写、卷在外面"这三件事画成一个你能记住的形状。如果你觉得自己对层的直觉还不够稳，先翻这本，再回来读本章第一节。</span>
+            </li>
+            <li>
+              <span class="bn">《Docker 实践》</span> <span class="ba">Ian Miell、Aidan Hobson Sayers 著</span>
+              <span class="bw">它的价值在"坑"：书里收集了大量真实世界里的错误用法与技巧，包括数据卷的误删、备份的失败模式、临时容器的高级用法。适合你动手做一个真实项目的阶段配合阅读，带着"我这次的操作如果出错，最坏会坏成什么样"这个问题去翻，把它当成本章的对照案例集。</span>
+            </li>
+          </ul>
+        </div>
+
+        <nav class="chnav" id="chnav"></nav>
+
+      </article>
+
+      <footer class="footer">
+        <p><b>深海与木箱 · Docker 深度学习手册</b>　第 06 章</p>
+        <p><a href="../index.html">← 返回总览与地图</a>　·　<a href="../glossary.html">术语总表</a></p>
+      </footer>
+    </div>
+  </main>
+</div>
+
+<script src="../data/terms.data.js"></script>
+<script src="../data/chapters.data.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

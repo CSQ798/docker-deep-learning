@@ -1,0 +1,7 @@
+# 统一换行符与编码，避免在 Windows / macOS / Linux 之间协作时出现"整文件改动"或中文乱码。
+* text=auto eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.js   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf

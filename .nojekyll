@@ -1,0 +1,3 @@
+# 让 GitHub Pages 跳过 Jekyll 处理。
+# 本项目是纯静态站点（HTML + CSS + JS），不需要 Jekyll；
+# 关掉它还能避免以 "_" 开头的文件（例如 chapters/_TEMPLATE.html）被 Jekyll 忽略。

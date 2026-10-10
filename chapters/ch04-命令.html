@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 04 章 · 命令与容器：把生命周期的每一天过明白 · 深海与木箱</title>
+<meta name="description" content="容器五种状态的精确语义、run 与 create+start 的关系、exec 与 attach 的分工、退出码推理、inspect、stats、资源限制、重启策略，以及一套固定的排障动作顺序。">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="ch04">
+
+<header class="topbar" id="topbar"></header>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="main">
+    <div class="wrap">
+      <article class="article" id="article">
+
+        <!-- ===================== 章首 ===================== -->
+        <div class="ch-eyebrow"><span class="num">第 04 章</span><span>手 上 的 工 具 · EVERYDAY CLI</span></div>
+        <h1>命令与容器：把生命周期的每一天过明白</h1>
+        <p class="ch-tagline">命令行不是门槛，而是你和系统之间最短的那条路。</p>
+
+        <div class="block goal">
+          <span class="bt">本 章 学 习 目 标</span>
+          <ul>
+            <li>能说清容器五种状态各自的物理含义，并解释每种状态为什么必须单独存在。</li>
+            <li>能解释 docker run 与「docker create 加 docker start」的等价关系，以及 Docker 为什么要拆成两条命令。</li>
+            <li>能拆开 -it 这个组合参数，说明 -i 与 -t 各自控制什么，以及在只给其中一个时会发生什么。</li>
+            <li>能解释 docker exec 与 docker attach 在进程层面上的根本差异，并判断某个场景该用哪一个。</li>
+            <li>能从一个退出码出发，配合日志与 inspect 输出，推理出容器到底经历了什么，而不是靠猜。</li>
+            <li>能说清资源限制为什么是「红线」而不是「建议」，以及不设限制时你要承担什么风险。</li>
+            <li>能建立一套固定的排障动作顺序，面对陌生故障时按顺序推进，不跳步骤。</li>
+          </ul>
+        </div>
+
+        <div class="block skill">
+          <span class="bt">学 完 之 后 ， 你 应 该 能 够</span>
+          <ul>
+            <li>能写出：为一个后台服务的镜像配上正确的启动参数组合，并说明每个参数解决什么问题。</li>
+            <li>能判断：一个容器该用 exec 进去看，还是该先看日志、根本不该进去。</li>
+            <li>能解释：同一个退出码 137，可能来自三种完全不同的原因，以及怎么区分它们。</li>
+            <li>能排查：容器反复重启、起来就退出、在跑但服务连不上，这三类高频故障。</li>
+            <li>能设计：为一个多容器小项目制定资源上限与重启策略，并说明取舍依据。</li>
+            <li>能识别：哪些命令看起来无害，实际上等价于「格式化硬盘」这个级别的破坏。</li>
+          </ul>
+        </div>
+
+        <p class="ch-lead">第 03 章我们把镜像剖开了：它是分层的、只读的、按内容寻址的，是一块可以搬运的化石。可化石不会自己走路。你在终端里敲下的每一条 docker 命令，本质上都是在跟一个活的东西打交道——一个正在运行、随时可能暂停、随时可能死掉的主进程。这一章讲的就是怎么跟它相处：它有哪些状态、命令怎样改变状态、状态异常时按什么顺序找原因。</p>
+
+        <!-- ===================== 正文 ===================== -->
+        <h2 id="s1">容器的一生只有五种状态</h2>
+
+        <p>先给你这一章最基础、也最容易被跳过的一句话：<strong>容器的生命周期，就是其中 1 号进程的生命周期。</strong>这不是修辞。它会直接决定你后面所有命令的语义，包括为什么「容器停了」这件事有时是故障、有时是正常收工。</p>
+
+        <p>回忆第 03 章的结论：容器等于镜像的各只读层加一层可写层，再加一份运行时状态。这份状态里最核心的一项，就是那个被启动起来的主进程。Docker 记录它的生死，把它翻译成五种我们能看懂的状态。命令是 <code>docker ps</code>，加 <code>-a</code> 才能看到非运行中的容器。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>状态</th><th>物理含义</th><th>谁把它推进这个状态</th></tr></thead>
+            <tbody>
+              <tr><td>created</td><td>容器对象已经存在：可写层已备好、配置已写入、命名已登记，但主进程一次都没被启动过</td><td>docker create</td></tr>
+              <tr><td>running</td><td>主进程正在内核里跑，占用着属于它的进程号、挂载视图、网络视图与资源配额</td><td>docker start、docker run、docker restart、docker unpause</td></tr>
+              <tr><td>paused</td><td>主进程还在内存里、还占着内存页，但被内核冻住了，一个指令周期都不再获得</td><td>docker pause</td></tr>
+              <tr><td>exited</td><td>主进程已经结束，退出码已记下，可写层还在，一切文件改动都还在</td><td>主进程自己退出、docker stop、docker kill</td></tr>
+              <tr><td>dead</td><td>Docker 想删除这个容器但没能删干净，它承认自己处在一个说不清的状态</td><td>删除失败之后</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>这张表要背的不是状态名，而是「物理含义」那一列——状态名只是标签，它才是真相。</p>
+
+        <h3 id="s1-1">created：一个提前做好的空壳</h3>
+
+        <p>created 乍看很怪：为什么要有「创建了但没启动」这个中间态？直接创建就启动不是更省事吗？</p>
+
+        <p>原因在于创建和启动的成本不一样。创建时 Docker 要叠加挂载镜像的各层、在上面挂一层可写层、生成一份配置（环境变量、挂载点、网络、资源上限、重启策略）、在数据目录里登记一笔记录；启动时只做一件事，让运行时照着那份配置把进程关进笼子里跑起来。前者慢而静态，后者快而可重复，所以 Docker 把它们拆开了。</p>
+
+        <p>所以一个 created 的容器，是一个「配置已经冻结、随时能点火」的东西。第 08 章你会看到，编排系统正是靠这个拆分来实现「先建好整套拓扑、再统一启动」。</p>
+
+        <pre data-lang="bash"><code>docker create --name box nginx:alpine
+docker ps --filter "name=box"
+docker ps -a --filter "name=box"
+docker start box
+docker logs box</code></pre>
+        <p class="cmd-note">第二条命令的输出里<strong>没有</strong> <code>box</code>——因为 docker ps 默认只列 running。第三条加上 <code>-a</code> 才看得到它，状态列写着 <code>Created</code>。「创建成功却查不到」这个瞬间，是你第一次意识到「容器存在」和「容器在跑」是两件事。start 之后状态变成 <code>Up</code>，logs 会打出 nginx 的启动信息。</p>
+
+        <h3 id="s1-2">running 与 paused：一个关于 CPU 的细节</h3>
+
+        <p>停一下看 paused。<code>docker pause</code> 冻结容器时，用的是 Linux 内核的 freezer 机制——它属于 cgroups 的一部分。冻结的效果是：这个容器里的所有进程都不再被调度器分配 CPU 时间片。注意它不释放内存：地址空间还在、打开的文件描述符还在、网络连接还在（对端看到的是一个突然不回包的连接）。它不是「暂停服务」，而是「时间停止」。</p>
+
+        <p>两个推论：pause 几乎不耗 CPU 却照样占住内存，所以它不适合省资源，只适合临时让开 CPU 或冻结现场；被冻结的容器不会响应优雅退出信号——信号送进去了，但没人被调度去处理它，所以 stop 一个 paused 容器会等满超时再强杀。第 05 章会讲进程号 1 与信号的完整规则。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name ticker alpine sh -c "while true; do sleep 1; echo alive; done"
+docker pause ticker
+docker ps --filter "name=ticker"
+docker logs --tail 3 ticker
+docker unpause ticker</code></pre>
+        <p class="cmd-note">暂停之后状态列是 <code>Up ... (Paused)</code>。等等再看 logs 的最后三行，时间戳不再变化——日志被冻在了暂停的那一刻；unpause 之后继续打印。pause 停住的是进程，不是容器对象。</p>
+
+        <h3 id="s1-3">exited 与 dead：结束，以及结束失败</h3>
+
+        <p>exited 最需要你改变直觉。很多人默认「容器停了等于坏了」，事实是：<strong>一个容器跑到 exited，大多数情况下是它正常完成了任务。</strong>你跑 <code>docker run hello-world</code> 之后那个容器就是 exited(0)，它做得完美无缺。</p>
+
+        <p>exited 里有两样东西被保留：退出码（在 <code>docker inspect</code> 里叫 <code>State.ExitCode</code>）和整个可写层——你创建的文件、改过的配置一样都没少。「容器停了」和「数据丢了」是两件完全无关的事，真正会丢数据的是 <code>docker rm</code>。dead 是删除时删不干净留下的墓碑，遇到它别研究玄学，先看内核里有没有相关进程残留，再重启 Docker 服务本身。</p>
+
+        <pre data-lang="bash"><code>docker run --name done alpine echo "任务完成"
+docker ps -a --filter "name=done" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+docker rm done</code></pre>
+        <p class="cmd-note">第二条用 <code>--format</code> 加 Go 模板只挑出名字、状态、镜像三列，你会看到状态是 <code>Exited (0) ...</code>。删掉它之后可写层才真正从磁盘上消失——这是第 06 章的伏笔。</p>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 03 章讲过「容器的可写层」，当时它只是一个概念。现在你可以亲手验证它：<code>docker run --name layer-test alpine sh -c "echo 写在可写层 &gt; /note.txt"</code>，然后 <code>docker start layer-test</code> 再 <code>docker exec layer-test cat /note.txt</code>。文件还在。可你一旦 <code>docker rm layer-test</code>，它就再也找不回来了。<strong>「停止」保住可写层，「删除」销毁可写层——这两个动作在数据层面的差别，比它们在字面上的差别大得多。</strong></p>
+        </div>
+
+        <div class="block metaphor">
+          <span class="bt">比 喻</span>
+          <p>容器更像一次航行，而不是一处房产。dockerd 是船坞：docker create 是「把船造好停在坞里、漆刷完、货装好，就是还没下水」，docker start 是「推它下水、点火」。船沉了（exited）不等于船没了——残骸还在坞里，货还在舱里，你可以让人下潜去看它哪儿漏了（logs 与 inspect），也可以选择彻底拆解它（rm）。而 pause 是「把船冻在时间的琥珀里」。真正对应「格式化硬盘」的是删卷，那是把海底的仓库整体清空，跟拆船不是一回事。</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>一个正在处理用户请求的服务被 pause 了 30 秒，对客户端来说这 30 秒里到底发生了什么？你能在另一台机器上观察到这件事吗？<span class="sub">提示：从 TCP 的角度想，对端能收到的只有「没有响应」，它区分不出「进程被冻住」和「网络断了」和「机器很慢」。</span></li>
+            <li>Docker 提供了 pause 却几乎没人用。一个功能存在但没人用，通常说明什么？什么场景下你会真的需要它？<span class="sub">提示：想想「我要抓一个正在出问题的进程的内存快照，但不想让它继续改内存」。</span></li>
+            <li>容器这五种状态里，哪一种最容易被误判成故障？为什么误判会带来真实损失？<span class="sub">提示：想想监控系统对着退出码 0 的容器报警会发生什么。</span></li>
+          </ol>
+        </div>
+
+        <h2 id="s2">docker run 只是两件事加一个包装</h2>
+
+        <p>现在把那条等价关系正式写清楚。它值得你抄在笔记本第一页：</p>
+
+        <blockquote><p>docker run = 从镜像创建容器（create）+ 启动它（start）+ 把本地终端可选用地接上去（-i / -t）。它是一条便利命令，不是一条独立的、有自己魔法的命令。</p></blockquote>
+
+        <p>为什么要讲透这个拆解？因为几乎所有的容器入门困惑都能从这句话推出来。为什么两次 <code>docker run</code> 会有两个容器？因为每次 run 都是一次新的 create。为什么 <code>docker ps -a</code> 里堆了几十个 exited 容器？因为每个 run 都建了一个，而你从没删过。为什么 <code>-p</code> 和 <code>-v</code> 不能事后改？因为它们属于创建期配置。</p>
+
+        <p>反过来，如果你用 <code>docker create</code> 加 <code>docker start</code>，这些限制就变成了可以操作的步骤：先创建、挨个 inspect 检查配置、确认无误后一次性启动。这也是 CI 流水线与 Compose 内部更愿意走这条路的原因。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name web1 -p 8080:80 nginx:alpine
+docker create --name web2 -p 8081:80 nginx:alpine
+docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"</code></pre>
+        <p class="cmd-note">第三条的输出是这一节的答案：<code>web1</code> 是 <code>Up</code>，端口列写着 <code>0.0.0.0:8080-&gt;80/tcp</code>；<code>web2</code> 是 <code>Created</code>，端口列已经写着 <code>0.0.0.0:8081-&gt;80/tcp</code>。映射规则在创建阶段就写好了，只是没有进程在接客。这时打开 <code>localhost:8081</code> 是打不开的，<code>docker start web2</code> 之后再刷新页面就出来了。</p>
+
+        <h3 id="s2-1">run 的参数分三类，类别决定它们什么时候生效</h3>
+
+        <p>新手把 <code>docker run</code> 后面的参数当成一锅乱炖，背一个算一个。更好的做法是按「生效阶段」分三类——分完之后你就不用背了，你能推。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>类别</th><th>典型参数</th><th>什么时候被固定下来</th><th>事后能改吗</th></tr></thead>
+            <tbody>
+              <tr><td>创建期配置</td><td>--name、-p、-v、-e、--network、--restart、--memory、--cpus、--pids-limit</td><td>docker create 的那一刻，写进容器元数据</td><td>不能。要改只能删除重建，这是不可变基础设施的雏形</td></tr>
+              <tr><td>运行期行为</td><td>-d、-it、--rm、命令与命令参数</td><td>docker start 的那一刻，交给运行时执行</td><td>命令不可改；-it 的差别在于是不是把终端接进去</td></tr>
+              <tr><td>查询与输出</td><td>--format、-q、--filter</td><td>只在这次命令行里生效，从不写入任何状态</td><td>随便改，它们只影响「怎么显示」</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>举个例子：有人把容器的内存上限写成 128MB，服务起不来，他到处找「怎么改运行中容器的内存上限」。答案是改不了，只能 <code>docker rm</code> 之后重新 <code>docker run</code> 一个。还有人纠结 <code>-d</code> 能不能「切换」——不能，它只决定这次启动要不要把终端接上去。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>把 <code>--rm</code> 和 <code>docker rm</code> 混在一起想。它们是两个不同时机的东西：<code>--rm</code> 是「我预先声明，这个容器退出时请自动删掉它」，<code>docker rm</code> 是「我现在就删」。真正的坑是两者都不做：你跑了二十次实验，二十个 exited 容器静静躺在那儿，每个都占着可写层。跑几天之后磁盘少了几个 GB，然后你开始怀疑 Docker 很占地方。<code>docker run --rm</code> 应该成为你做一次性实验时的默认动作，就像写完草稿随手撕掉。</p>
+        </div>
+
+        <h3 id="s2-2">-d 与前台：一个关于「谁来看日志」的选择</h3>
+
+        <p><code>-d</code> 是 <code>--detach</code>，意思是启动之后把容器放后台，命令行立刻还给你。不加它就是前台运行：主进程的标准输出直接接到你的终端上，你会实时看到它打印的每一行，直到它退出或者你按 <code>Ctrl-C</code>。<strong>这两种模式决定的是「这台终端要不要被占住」以及「你能不能直接看到输出」。</strong>前台运行时你根本不需要 <code>docker logs</code>——日志就在屏幕上，实时、带颜色、没有缓冲延迟。所以更有用的规则是：第一次跑一个新镜像时先用前台跑一次，确认行为正常了再改成 <code>-d</code>。这也解释了为什么很多人第一次跑 <code>docker run nginx</code> 会觉得「终端卡住了」——它没卡，nginx 正在前台正常服务，只是它不打印东西。</p>
+
+        <pre data-lang="bash"><code>docker run --rm -p 8090:80 nginx:alpine</code></pre>
+        <p class="cmd-note">这一条没有 <code>-d</code>，终端被占住，你只看到一个安静的光标。开另一个 PowerShell 窗口跑 <code>curl.exe http://localhost:8090</code>，会看到 nginx 的欢迎页 HTML——服务是真的在跑（Windows 上要写 <code>curl.exe</code>，直接写 <code>curl</code> 会调到别名）。回到第一个窗口按 <code>Ctrl-C</code>，容器随之结束。</p>
+
+        <h3 id="s2-3">命令末尾的参数，以及 --entrypoint 覆盖的是哪一层</h3>
+
+        <p>先看一个可观察的现象，原理留到第 05 章：镜像里可以写一个默认命令（Dockerfile 里叫 CMD），而 <code>docker run</code> 最后写的东西会去跟它抢位置。</p>
+
+        <pre data-lang="bash"><code>docker run --rm nginx:alpine echo 你好
+docker run --rm --entrypoint echo nginx:alpine nginx 启动参数</code></pre>
+        <p class="cmd-note">第一条不会启动 nginx，而是直接执行 <code>echo 你好</code> 然后退出——末尾写的东西<strong>整条替换掉了</strong>镜像的默认命令。第二条用 <code>--entrypoint echo</code> 把入口程序换成 echo，于是 <code>nginx</code> 和 <code>启动参数</code> 被当成参数原样打印。这就是「替换默认参数」与「替换入口程序」的差别。</p>
+
+        <h3 id="s2-4">-it：两个字母各管一件事</h3>
+
+        <p>现在拆 <code>-it</code>。<code>-i</code> 是 <code>--interactive</code>，意思是保持标准输入打开，把终端按键送进容器的标准输入；没有它，容器的标准输入会直接关掉，任何想读键盘的程序立刻读到文件结束。<code>-t</code> 是 <code>--tty</code>，意思是给容器分配一个伪终端——伪终端提供行编辑、回显、提示符、窗口大小这些「终端感」。两个字母各管一件事。</p>
+
+        <pre data-lang="bash"><code>docker run -i --name no-tty alpine sh
+docker run -t --name no-stdin alpine sh</code></pre>
+        <p class="cmd-note">第一条是一个没有提示符的界面：输入 <code>echo hi</code> 能看到 <code>hi</code>，但输入不回显，屏幕像卡住了。第二条有提示符 <code>/ #</code>，但敲什么都毫无反应。这两个失败的体验合起来，就是 <code>-it</code> 存在的全部理由。</p>
+
+        <details>
+          <summary>展开：为什么「伪终端」这件事到现在还这么重要</summary>
+          <p>伪终端（pseudo-terminal，简称 pty）模拟的是更古老的物理终端。它的核心是一对设备：一端是程序（比如 shell）以为的终端，另一端是终端模拟器（比如你的 Windows Terminal）。中间这一对设备负责行缓冲、回显、把 Ctrl-C 转成信号、通知窗口大小变化等一堆琐事。</p>
+          <p>为什么容器里还要它？因为绝大多数程序启动时会问操作系统一句「我是不是连着一个终端」。如果是，它们就打开彩色输出、打印进度条、把日志按行刷新；如果不是（比如接进管道），它们就切成安静模式，输出纯文本、去掉颜色、改成块缓冲。所以在 PowerShell 里跑 <code>docker run --rm alpine ls --color=auto</code> 看不到颜色，加上 <code>-t</code> 颜色就回来了。由此得到一条好习惯：自动化脚本里不要加 <code>-t</code>，日志系统不需要一个假装是终端的东西。</p>
+        </details>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 02 章我们拆开过一次 <code>docker run</code>：命令行客户端把请求发给 dockerd，dockerd 让 containerd 准备镜像与容器，containerd 再让运行时去调内核接口把进程关起来。现在把这一章的视角接上去：那次内核调用的产物，就是容器进入 running 状态的那一刻。而 <code>docker create</code> 干的事只走到准备阶段就停住了。<strong>第 02 章学的是「谁在干活」，这一章学的是「干活时留下了哪些可以观察、可以操作的状态」。</strong></p>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>这一节一直在说「创建期配置事后改不了」。这个约束有个很有价值的副产品：它逼你把「一个容器该怎么跑」写成一份可以复制的文本。<code>-p 8080:80</code>、<code>-v 数据:/data</code>、<code>--restart unless-stopped</code>、<code>--memory 256m</code> 这一串参数，第 08 章会原封不动地变成 compose.yaml 里的几个字段。到那时你会发现，你这一章敲过的每一条长命令，都是一份 YAML 草稿。</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>如果 Docker 当初只提供 create 和 start，不提供 run，会发生什么？新手的入门体验会变成什么样？这门技术流行的速度会受影响吗？<span class="sub">提示：想想「默认值的力量」——便利命令的价值不在于省了几个字，而在于替你做了一批你当时还看不懂的决定。</span></li>
+            <li>-d 和前台运行的差别，本质上是「终端被谁占住」。那么一个既想要实时日志、又不想被占住终端的场景，你会怎么解决？<span class="sub">提示：先把 -d 跑起来，再用另一条命令把日志拉出来看。</span></li>
+          </ol>
+        </div>
+
+        <h2 id="s3">exec 和 attach 是两个完全不同的动作</h2>
+
+        <p>这是我见过最多人搞混、后果也最严重的一对命令。先记住一个结论：<strong>docker exec 是「在容器里另外开一个进程」，docker attach 是「把你的终端接到容器 1 号进程的输入输出上」。</strong>这句话里每个词都是承重的。</p>
+
+        <p><code>docker exec -it web bash</code> 做的事是：找一个已经在跑的容器，在它的命名空间里（同样的进程视图、挂载视图、网络视图、同一个资源配额）启动一个新进程，然后把你的终端接到这个新进程上。这个新进程的父进程不是容器主进程，而是这个容器的运行时垫片。最重要的一点：<strong>这个新进程和主进程是两个独立的进程，你退出这个进程，主进程毫发无损。</strong></p>
+
+        <p><code>docker attach web</code> 做的事完全不同：它找到容器的主进程，把你的终端直接连到它的标准输入、标准输出、标准错误上。听起来好像也能用，但它有几个立刻就会咬人的后果。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>对比项</th><th>docker exec</th><th>docker attach</th></tr></thead>
+            <tbody>
+              <tr><td>被连接的对象</td><td>容器里新起的进程</td><td>容器的主进程</td></tr>
+              <tr><td>按 Ctrl-C 会怎样</td><td>信号给到你的新进程，主进程不受影响</td><td>信号给到主进程，多数程序会直接退出，整个容器跟着结束</td></tr>
+              <tr><td>退出后容器还在吗</td><td>在</td><td>通常不在了</td></tr>
+              <tr><td>能看到什么</td><td>你能启动什么就看到什么，比如 shell、解释器、ps</td><td>只能看到主进程正在往标准输出打的东西</td></tr>
+              <tr><td>能连几个</td><td>可以同时开很多个，互不干扰</td><td>多个 attach 共享同一个输出流，互相抢字符</td></tr>
+              <tr><td>适用场景</td><td>排障、查看文件、跑一次性脚本</td><td>几乎没有推荐场景</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <pre data-lang="bash"><code>docker run -d --name quiet nginx:alpine
+docker exec quiet nginx -v
+docker exec -it quiet sh
+docker run -d --name busy alpine sh -c "while true; do echo tick; sleep 2; done"
+docker attach busy</code></pre>
+        <p class="cmd-note">第三条让你进到容器里，敲 <code>exit</code> 退出后 <code>docker ps</code> 里 <code>quiet</code> 还在跑。<strong>exec 是一次拜访，不是一次接管。</strong>在里面跑 <code>ps aux</code>，你会看到 nginx 主进程、worker 进程、还有你刚才那个 shell。最后一条 attach 之后 <code>tick</code> 每两秒跳一次；按 <code>Ctrl-C</code>，<code>busy</code> 会变成 <code>Exited (130)</code>。130 是 128 加 2，2 是 SIGINT。你只是想退出终端，结果把整个容器杀了。</p>
+
+        <p>这就是 attach 的使用纪律：<strong>它想脱离得用 Ctrl-P 加 Ctrl-Q 这个组合，它会把你从流里摘出来而不发送任何信号。</strong>但记住它的人不多，所以在生产环境里正确做法是根本不 attach，要看输出就用 <code>docker logs -f</code>。</p>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>为什么 attach 默认会把 Ctrl-C 直通给容器主进程？这算设计失误吗？<span class="sub">提示：attach 的设计初衷是「像 ssh 一样接入一个前台进程」，而前台进程本来就该收到 Ctrl-C。问题也许不在它的行为，而在「把它用在后台服务上」这个用法。</span></li>
+            <li>你 exec 进去改了一个配置文件，重启容器之后改动消失了。请解释为什么，并说出这个现象对「线上出故障时有人进容器手改一行配置」意味着什么。<span class="sub">提示：可写层随容器删除而消失；不可变基础设施。</span></li>
+          </ol>
+        </div>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>遇到一对名字相似的命令（exec 与 attach、stop 与 kill、save 与 export、cp 与卷），不要孤立地背它们的用法。用同一组问题问两遍：「它在哪个进程上做事？」「它改的是哪一层数据？」「它的效果能不能撤销？」把两个命令的答案并排放着，差别自己就浮出来了。这个方法能对付你以后遇到的绝大多数命令对——它的力量来自「命令是对状态的操作」这个统一视角，而不是来自记忆。</p>
+        </div>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>还有一条更省力的判断规则：<strong>能用日志和 inspect 解决的，就不要进容器。</strong>一遇到问题就 exec 进去翻文件，你看到的只是一堆此刻的快照，没有历史、没有对照、也没有别人留下的痕迹。而日志里有时间顺序，inspect 里有 Docker 记下的客观事实：什么时候启动的、退出了几次、退出码是多少、有没有被内存超限杀过。先读这两样，你通常已经知道答案了；exec 是最后一步的确认手段，不是第一步的探索手段。</p>
+        </div>
+
+        <h2 id="s4">日志、退出码与 inspect：排障的三块地基</h2>
+
+        <h3 id="s4-1">日志背后那套「应用只管往标准输出打印」的哲学</h3>
+
+        <p>要理解 <code>docker logs</code>，先接受一件反直觉的事：Docker 并没有为日志设计一个「日志文件」。你在容器里找不到 Docker 帮你写的 <code>/var/log/app.log</code>，也没有配置告诉应用「日志该写到哪」。</p>
+
+        <p>真实情况是：容器主进程往标准输出和标准错误打印什么，Docker 就把这些字节流截下来，一行一行加上时间戳，存到宿主机上的一个文件里（默认驱动叫 json-file，每条记录一行 JSON）。<code>docker logs</code> 做的事只是把这个文件的内容格式化打印给你。所以——<strong>如果应用的日志写进自己创建的文件里，docker logs 就什么都看不到。</strong>这不是 bug，这是设计。</p>
+
+        <p>为什么这么设计？因为它把一个纠缠了运维几十年的问题切开了。传统做法里日志文件归应用自己管：应用要学会轮转（不然磁盘写满）、要学会压缩、要知道自己部署在哪台机器上、要有权限写那个目录。于是「日志」这件事被复制到每一个应用里，每个都实现一遍，每个都实现得不太一样。容器化把责任重新划分：应用只管把发生的事说到标准输出上，至于这些字节流去哪、存多久、怎么检索——那是运行环境的事。</p>
+
+        <blockquote><p>应用不应该知道日志最终去了哪里。它只负责把事情说清楚，剩下的交给环境。这条分工让「换一套日志基础设施」不再需要改一行应用代码。</p></blockquote>
+
+        <p>第 10 章会完整展开这套做法：当你有二十个容器分散在三台机器上，你不希望挨个登上去翻文件，你希望所有日志按容器名、时间、服务这几个维度统一检索。而这一切的前提，就是应用从一开始就往标准输出吐日志。第 12 章讲十二要素应用时，这条原则会被列成一条独立的要素——「把日志当作事件流」。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name logs-demo nginx:alpine
+docker logs --tail 5 --timestamps logs-demo
+docker logs --since 5m logs-demo
+docker logs -f --tail 0 --timestamps logs-demo</code></pre>
+        <p class="cmd-note">第二条只给最后五行并显式打时间戳——它能告诉你「这条错误是容器启动第 3 秒还是第 300 秒出现的」。第三条只要最近五分钟，比 <code>--tail</code> 更好用，因为「五分钟」对应的是故障发生之后。第四条的 <code>--tail 0</code> 表示不要历史、只要从现在开始的新内容，<code>-f</code> 表示持续跟随。按 <code>Ctrl-C</code> 停的只是你本地的读取，容器毫无感觉——和 attach 的行为正好对照。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>把「日志不会丢」当默认事实，以及把「日志是空的」当成 Docker 的问题。<code>json-file</code> 驱动默认<strong>不限制单个日志文件的大小</strong>，一个每秒打印几行的服务可以在一夜之间把宿主机的磁盘写满；Docker Desktop 跑在 WSL2 的虚拟磁盘里，磁盘写满之后的表现是所有容器一起出问题。应对方式是在创建容器时配上 <code>--log-opt max-size=10m --log-opt max-file=3</code>，并把日志收集出去。另一头是「日志为空」的两种原因：应用把日志写进了自己的文件，或者应用把自己守护进程化了（后台 fork 出进程、父进程退出，标准输出随之断开）。还有一种是「日志有两分钟延迟」——输出被缓冲在内存里了，因为运行时会判断「我的输出目标是管道而不是终端」而切换成块缓冲。加了 <code>-t</code> 的容器不容易被缓冲，但<strong>正确的修法是让应用显式关掉缓冲，而不是靠加 -t 绕过</strong>。</p>
+        </div>
+
+        <h3 id="s4-2">退出码：从数字倒推事件</h3>
+
+        <p>下面这张表建议你抄一遍。容器主进程结束时会返回一个整数，Docker 把它记在元数据里。你能在两个地方看到它：<code>docker ps -a</code> 的状态列，或者 <code>docker inspect</code> 里的 <code>State.ExitCode</code>。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>退出码</th><th>含义</th><th>你要往哪个方向查</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td>主进程正常结束，它自己认为任务完成了</td><td>别查了，这是成功。你要问的是「我是不是本来希望它一直跑」</td></tr>
+              <tr><td>1</td><td>应用自己报错并决定退出，这是程序的判断，不是内核的干预</td><td>看日志。第一行和最后二十行通常就有答案：缺依赖、配置错、端口被占、连不上依赖服务</td></tr>
+              <tr><td>2</td><td>通常是「命令行用法错误」，很多 shell 与工具沿用这个约定</td><td>看你在命令行里传了什么。很可能是命令拼错或参数格式错</td></tr>
+              <tr><td>126 / 127</td><td>找到了程序但没有执行权限 / 找不到这个命令</td><td>查权限位与 shebang；查这个命令在容器里到底存不存在</td></tr>
+              <tr><td>130</td><td>128 加 2，被 SIGINT 杀死</td><td>有人按了 Ctrl-C，可能就是你</td></tr>
+              <tr><td>137</td><td>128 加 9，被 SIGKILL 杀死。需要展开推理</td><td>见下面专门一段</td></tr>
+              <tr><td>143</td><td>128 加 15，被 SIGTERM 杀死</td><td>docker stop 的正常结果，这是有人要求它停、它配合了</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>先讲规律。128 加 N 这个约定来自 shell：当它发现子进程是被信号杀死而不是正常返回时，它约定用一个 128 以上的数字表示「死于信号 N」。所以看到 130 就该想到 SIGINT，看到 143 就该想到 SIGTERM。这是你从数字反推事件的第一把钥匙。143 基本可以放心：<code>docker stop</code> 默认先发 SIGTERM 给主进程，等它十秒，如果它自己退出了，退出码就是 143。</p>
+
+        <p>137 就不一样了，它至少有三个来源，你必须靠别的证据来区分。第一种：有人执行了 <code>docker kill</code>。<code>kill</code> 和 <code>stop</code> 的区别就在这里——stop 是「请你体面地走」，kill 是「立刻死」，进程无法捕获、无法清理、无法保存数据。第二种，也是最需要你认识的：容器被内核的内存不足终结者杀了。这是 Linux 的「丢车保帅」机制：内存紧张到一定程度，内核必须杀掉某些进程来保住整台机器。如果你的容器设了 <code>--memory</code> 而它用超了，内核会把这个资源组里的进程杀掉，表现就是退出码 137，且日志在最后一刻毫无征兆地断掉。判断方法很直接：<code>docker inspect</code> 里有一个字段 <code>State.OOMKilled</code>，超限被杀时它是 <code>true</code>。第三种：宿主机整体内存告急，内核在全局范围挑了一个最该杀的进程，恰好是你的容器。</p>
+
+        <pre data-lang="bash"><code>docker run --name oom-demo --memory 64m python:3.12-alpine python -c "a = bytearray(200 * 1024 * 1024)"
+docker ps -a --filter "name=oom-demo"
+docker inspect --format "exit={{.State.ExitCode}} oom={{.State.OOMKilled}}" oom-demo</code></pre>
+        <p class="cmd-note">第二条你会看到 <code>Exited (137)</code>，第三条输出 <code>exit=137 oom=true</code>——被内存上限杀死的铁证。这个三段式推理（现象 137 → 查 OOMKilled → 得出结论）要练到条件反射。变体：把 <code>--memory</code> 提到 512m，同一个 Python 命令会以退出码 0 成功结束。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name sig-demo alpine sh -c "trap 'echo 收到 TERM; exit 0' TERM; while true; do sleep 1; done"
+docker stop sig-demo
+docker logs sig-demo
+docker inspect --format "{{.State.ExitCode}}" sig-demo</code></pre>
+        <p class="cmd-note">容器里那个 shell 捕获了 SIGTERM，打印一行「收到 TERM」，然后自己用退出码 0 结束，所以 inspect 给的是 <strong>0</strong> 而不是 143。这说明 143 不是 stop 的必然结果，而是「进程没处理信号、直接被信号终结」的结果。<strong>一个把 SIGTERM 处理好的应用，stop 之后退出码可以是 0。</strong>试试变体：把 trap 删掉重跑，退出码变回什么？</p>
+
+        <h3 id="s4-3">docker inspect：从「我记得应该是」走到「事实就是这样」</h3>
+
+        <p>如果只在这一章学会一件事，我希望是「不懂就 inspect」。它把容器、镜像、网络、卷的完整 JSON 描述全部倒给你——不是摘要，是原始事实。问题是它太长，一个 nginx 容器的输出动辄上千行，所以要学的是取值：用 <code>--format</code> 加 Go 模板只把关心的字段抠出来。</p>
+
+        <pre data-lang="bash"><code>docker inspect --format "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}" quiet
+docker inspect --format "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" quiet
+docker inspect --format "{{.HostConfig.Memory}}" quiet
+docker inspect --format "{{.RestartCount}}" quiet
+docker inspect --format "{{json .Config.Env}}" quiet</code></pre>
+        <p class="cmd-note">第一条把状态、退出码、是否被内存超限杀掉三个关键事实一次抠出来，是排障时敲得最多的一条。第二条用 <code>range</code> 遍历所有网络取 IP，比写死网络名稳妥。第三条显示内存上限，没设置时是 <code>0</code>——<strong>0 表示没有限制，不是「零字节」</strong>。第四条给出自动重启次数，是判断「容器在反复崩溃」最直接的证据。第五条把环境变量作为 JSON 打出。</p>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 01 章我们说过，容器最迷人的地方在于「它把环境显式写下来了，而不是让环境消失」。当时那句话听着像口号。现在你手里有了 inspect，可以亲自验证它：它打出来的那一大段 JSON，就是「这个容器的环境」的完整书面记录——环境变量、挂载、网络、资源上限、命令、工作目录，一条不少。</p>
+        </div>
+
+        <h2 id="s5">stats 与资源限制：把「红线」画出来</h2>
+
+        <p>容器共享宿主机内核这件事你在第 01 章学过了，这一节讲它的另一半：共享意味着争抢。你宿舍那台笔记本上可能同时跑着 Docker Desktop 的虚拟机、浏览器、IDE、还有一个在训练的模型。容器如果不管好自己的资源，遭殃的是整台机器。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name hog --cpus 0.5 alpine sh -c "while true; do :; done"
+docker stats --no-stream hog
+docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"</code></pre>
+        <p class="cmd-note">第二条给你一行数据：CPU 那列稳定在接近 <code>50.00%</code>。一个死循环只用到一半 CPU？因为 <code>--cpus 0.5</code> 就是「最多等价于半个核心的算力」，内核在调度层面替它执行了这条红线。把 <code>--cpus</code> 去掉重跑，CPU 会飙升。<code>--no-stream</code> 加了只打一次快照，适合贴给别人看。<strong>stats 最实用的价值，是让你亲眼确认「我设的限制到底生效了没有」。</strong></p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>参数</th><th>限制什么</th><th>超了会发生什么</th><th>什么时候必须设</th></tr></thead>
+            <tbody>
+              <tr><td>--memory 64m</td><td>这个容器能用的物理内存总量</td><td>内核杀掉容器内进程，退出码 137，OOMKilled 为 true</td><td>几乎所有长时间运行的容器，这是唯一一条「不设就可能拖垮整机」的限制</td></tr>
+              <tr><td>--cpus 0.5</td><td>可用的 CPU 算力，1 表示一个完整核心</td><td>不会被杀，只是被限速，表现为响应变慢、任务耗时变长</td><td>跑计算任务的容器，尤其是你一边训练一边还想用电脑的时候</td></tr>
+              <tr><td>--pids-limit 100</td><td>容器里进程与线程的总数上限</td><td>新建进程失败，应用报出一些看起来与资源无关的错</td><td>跑第三方代码、跑用户提交的脚本、防止 fork 炸弹</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>三种限制的「失手方式」不一样，这件事比参数本身更值得记住。内存超限是硬死——进程没了，inspect 里有证据。CPU 超限是慢——服务还在，只是跟不上，而且它不会留下任何日志，你只能靠观测发现。进程数超限是「部分功能坏掉」——主进程还活着，但每次它想启动一个子进程就会失败，日志里出现让你摸不着头脑的错误。</p>
+
+        <p>顺带分清一对概念：<code>--memory</code> 是硬限制，超了就杀；<code>--memory-reservation</code> 是软限制，它不保证任何东西，只在内存紧张时让内核优先回收超过这个数的部分，适合「我希望它平时能用到 512MB，但紧张时请先从我这里抢」。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name bomb --pids-limit 30 alpine sh -c "while true; do sleep 0.1; done &"
+docker logs bomb
+docker run --rm -it --pids-limit 20 alpine sh -c ":(){ :|:& };: ; sleep 1"</code></pre>
+        <p class="cmd-note">最后一条是著名的 fork 炸弹写法，会在容器内不断自我复制。加上 <code>--pids-limit 20</code> 之后它很快撞到上限并报错退出，而不是把你的笔记本拖死。<strong>这个实验请一定在容器里做，永远不要在宿主机上试。</strong>pids-limit 的意义不是性能，而是「把失控的程序关进可控的笼子」。</p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>给自带内存管理策略的运行时设内存上限时的经典翻车：容器限了 <code>--memory 512m</code>，但 Java 虚拟机默认按「宿主机的总内存」给自己划了一个 2GB 的堆，然后一启动就被杀掉，日志里连一句解释都没有。这个坑在 2018 年之前非常常见，因为早期的虚拟机和运行时看不见容器内存上限。教训是通用的：<strong>任何「自己有内存策略的运行时」（Java、Node 的堆上限、数据库的缓冲区配置）都可能与容器的内存上限打架，你需要让它们知道自己住在一个有天花板的房间里。</strong></p>
+        </div>
+
+        <h3 id="s5-1">重启策略：把「保持运行」写成一条声明</h3>
+
+        <p>容器退出之后要不要自动拉起来？这是你必须显式回答的问题。Docker 的默认答案是「不拉」，把决定权交给 <code>--restart</code>。注意它是创建期配置。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>取值</th><th>含义</th><th>什么时候用</th><th>代价</th></tr></thead>
+            <tbody>
+              <tr><td>no</td><td>退出就退出，不重启。这是默认值</td><td>一次性的任务容器：跑测试、生成报告、导出数据</td><td>长期服务忘了设，机器重启后它就永远不在了</td></tr>
+              <tr><td>on-failure</td><td>只有退出码非 0 才重启，可写成 on-failure:5 限定最多连续五次</td><td>批处理任务、有机会靠重试成功的作业</td><td>如果应用「坏了但退出码是 0」，它不会重启，你会盯着一个安静的容器发呆</td></tr>
+              <tr><td>always</td><td>不管退出码是什么都重启，Docker 服务重启后也会拉起它</td><td>必须一直活着的服务</td><td>你自己 stop 之后，重启服务它又回来了；反复崩溃的服务会变成无限重启的循环</td></tr>
+              <tr><td>unless-stopped</td><td>和 always 几乎一样，唯一区别：你手动 stop 过的容器不会被强行复活</td><td>绝大多数长时间运行的服务</td><td>几乎没有。这是它成为生产默认选择的原因</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>在 always 和 unless-stopped 之间做选择，其实是在回答「谁有最终决定权」。手动停掉一个服务是人为意图，机器重启是环境事件。always 的立场是「环境事件可以让一切复活，包括你亲手停掉的」；unless-stopped 的立场是「人的意图优先」。后者更符合直觉：你半夜三点停掉一个服务，不会希望早上重启机器后它又跑起来，跟另一个同端口的服务打架。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name stubborn --restart unless-stopped alpine sh -c "echo 启动; sleep 30"
+docker inspect --format "{{.HostConfig.RestartPolicy.Name}}" stubborn
+docker stop stubborn
+docker update --restart no stubborn</code></pre>
+        <p class="cmd-note">第二条确认策略真的写进去了。手动 <code>docker start</code> 永远有效，重启策略管的是「容器自己退出时」，两者不冲突。最后一条 <code>docker update</code> 是少数能改运行中容器配置的命令。为什么它可以而内存、端口、挂载不行？因为重启策略不是启动时需要的参数，而是 dockerd 在容器退出那一刻才去读的，不需要重建容器。</p>
+
+        <p>关于重启策略，有一个隐藏的代价：<strong>它会掩盖故障。</strong>一个反复崩溃的服务配上 always 之后，就不再是「挂掉的容器」，而是「看起来一直在跑、但每分钟重启一次」的容器。你敲 <code>docker ps</code>，它状态是 Up，你可能好几天不觉得有问题。真正暴露它的是 <code>docker inspect</code> 里的 RestartCount，还有状态列里那个很小的运行时长——<code>Up 3 seconds</code> 对一个已经部署三天的服务来说是可疑的。所以请你养成一个习惯：<strong>看到「Up 了几秒」的容器，立刻去查 RestartCount。</strong></p>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>一个服务因为配置里写错了一个主机名而启动失败。配上 always 之后它会每秒钟重启一次，日志滚成一座山，几十 GB 磁盘就没了。这是使用者的错，还是默认行为设计得不够谨慎？更好的方案应该长什么样？<span class="sub">提示：想想退避策略——第一次等 1 秒，第二次 2 秒，第四次 8 秒。再想想编排系统里为什么要引入「崩溃循环」这个概念。</span></li>
+            <li>既然 unless-stopped 在几乎每个方面都不比 always 差，为什么 always 还留着？<span class="sub">提示：想想那些「必须无条件复活」的场景，以及一个连手动 stop 都被视为错误操作的环境。</span></li>
+            <li>docker stats 显示某个容器内存占用一直在涨、从不回落。这可能只是缓存型程序在热身，也可能是内存泄漏。在不读代码的前提下，你能设计出什么办法区分这两者？<span class="sub">提示：缓存会在压力下释放——给它一个紧一点的内存上限，看它会不会稳定下来；泄漏不会。</span></li>
+          </ol>
+        </div>
+
+        <h2 id="s6">空间与进出：cp、卷，与「删卷等于格式化硬盘」</h2>
+
+        <h3 id="s6-1">docker cp：一次性的搬运工</h3>
+
+        <pre data-lang="bash"><code>docker run -d --name box2 nginx:alpine
+docker cp box2:/etc/nginx/nginx.conf ./nginx.conf
+docker cp ./nginx.conf box2:/tmp/nginx.conf.bak
+docker exec box2 cat /tmp/nginx.conf.bak</code></pre>
+        <p class="cmd-note">第一条把容器里的配置文件取到当前目录，第二条把本地文件塞回容器里的临时路径。<code>docker cp</code> 双向都能用，语法差别只是路径前有没有容器名加冒号。两个方向上它都是「一次性」的：取出来的是那一刻的快照，塞进去的东西在容器删除后就不存在了。</p>
+
+        <p>这个命令很有用，但它的存在本身是一个信号。什么情况下你需要它？容器里产生了一个你想要的产物（训练好的模型、导出的报告、崩溃时的转储文件），或者想临时塞一个配置进去验证想法。但如果你发现自己<strong>每天</strong>都在 cp 同一批文件，那说明你的项目缺了一个挂载或构建步骤。工具被高频使用，往往意味着流程设计出了偏差。</p>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>把文件送进容器的正确姿势是数据卷和绑定挂载，那是第 06 章的全部主题。这里先埋一个伏笔：这一节你会看到「删容器时数据一起消失」，而卷的设计目标恰恰就是让数据在容器死死生生之间活下来。区别只在于你把数据放在容器的可写层里，还是放在一个由 Docker 单独管理、生命周期独立的位置上。</p>
+        </div>
+
+        <h3 id="s6-2">docker system df：先把账算清楚</h3>
+
+        <pre data-lang="bash"><code>docker system df
+docker system df -v
+docker volume ls</code></pre>
+        <p class="cmd-note">第一条给你四行账：镜像、容器、数据卷、构建缓存各占多少，以及括号里的「可回收」部分。第二条加 <code>-v</code> 展开到具体对象，你能看到是哪个镜像、哪个卷在占地方。<strong>这张表是所有清理动作的前提——删任何东西之前，先搞清楚空间是谁占的。</strong>我见过太多次「磁盘满了先 prune 一下」，镜像被全清、重新拉了 2GB，而真正的黑洞其实是个匿名卷。</p>
+
+        <h3 id="s6-3">prune：危险边界在哪里</h3>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>命令</th><th>删掉什么</th><th>危险级别</th></tr></thead>
+            <tbody>
+              <tr><td>docker image prune</td><td>悬空镜像，也就是没有标签、也没被任何容器引用的中间产物</td><td>低：这些通常确实是垃圾</td></tr>
+              <tr><td>docker container prune</td><td>所有处于 exited 状态的容器，以及它们的可写层</td><td>中：某个已停容器里有你没取出来的数据，它就没了</td></tr>
+              <tr><td>docker image prune -a</td><td>所有没有被任何容器使用的镜像，包括你刚拉下来还没用的</td><td>中高：下次用要重新下载，离线环境会直接卡住</td></tr>
+              <tr><td>docker volume prune</td><td>所有没有被任何容器使用的数据卷</td><td>极高：见下</td></tr>
+              <tr><td>docker system prune</td><td>已停容器、悬空镜像、未使用的网络、悬空构建缓存</td><td>高：它不含卷，但已经足够让人后悔</td></tr>
+              <tr><td>docker system prune -a --volumes</td><td>上面全部，外加所有未使用的镜像和数据卷</td><td>灾难级：这就是那条红线</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <blockquote><p>删数据卷和格式化硬盘是同一件事。区别只在于，格式化硬盘时你知道自己在格式化哪一块，而清理卷时你往往不知道自己在删什么——卷的名字是一串随机 ID，它不会喊疼。</p></blockquote>
+
+        <p>为什么卷这么危险？因为「没有被任何容器使用」有两种完全不同的含义：它真的是垃圾，或者「你上周把数据库容器删了准备重建，数据还在卷里等着被重新挂上」。Docker 无法区分——从它的角度看两者完全一样。命令会平静地问你一句 yes/no，你说 yes，几百 GB 数据在几秒内消失，而且没有回收站。</p>
+
+        <p>所以有三条纪律。第一条：<strong>不用 <code>-a</code> 和 <code>--volumes</code>，除非你已经先跑过 <code>docker system df -v</code>，并且能指着屏幕说出每一个即将被删的卷是什么。</strong>第二条：给重要的卷起名字——<code>-v mysql-data:/var/lib/mysql</code> 里的名字至少让人能读懂，匿名卷是一串随机字符，你在确认问题面前根本无从判断。第三条：执行之前先 <code>docker volume ls</code>，把可疑的名字记下来。</p>
+
+        <pre data-lang="bash"><code>docker volume ls
+docker system df -v
+docker container prune</code></pre>
+        <p class="cmd-note">前两条是「看」，后一条是「擦」。<code>docker container prune</code> 会要一次确认，输入 <code>y</code> 才执行——这是 Docker 给你的最后一个刹车。在任何 prune 之前先跑前两条，并且真的读一遍输出。<strong>把「看一眼再删」变成肌肉记忆，比记住几十个参数有用得多。</strong></p>
+
+        <div class="block alert">
+          <span class="bt">易 错 点</span>
+          <p>一个容易被忽略的雷区：<code>docker run -v</code> 挂载一个宿主机上<strong>不存在</strong>的目录时，Docker 会自动替你创建一个空目录并挂上去。路径打错一个字母，你的服务就在一个新目录里初始化了一套空数据库，而你完全不知道。所以第一次挂载时，先 <code>docker inspect</code> 看一下 Mounts 字段，确认 Source 真的是你想的那个路径。Windows 上尤其要注意：容器看到的路径是被 Docker Desktop 映射过的，写法与宿主机不同。相对好用的做法是用 PowerShell 的 <code>${PWD}</code> 拼出当前目录，比如 <code>docker run --rm -v "${PWD}:/data" alpine ls /data</code>。</p>
+        </div>
+
+        <div class="block think">
+          <span class="bt">思 考</span>
+          <ol>
+            <li>如果容器永远不会被删除，可写层里的数据是不是就等于持久化了？那你还有必要学数据卷吗？请从三个不同角度反驳「那我就不用卷了」。<span class="sub">提示：重建容器时会发生什么；多容器共享时会发生什么；备份与迁移时会发生什么。</span></li>
+            <li>Docker 在挂载一个不存在的宿主机目录时替你创建它，这个设计是帮忙还是帮倒忙？如果你是作者，你会怎么处理？<span class="sub">提示：想想「报错一次」和「静默地做一件你没说要做的事」，哪一个在三个月后更让人痛苦。</span></li>
+          </ol>
+        </div>
+
+        
+        <h2 id="s7">一套固定的动作顺序：先状态，后推理</h2>
+
+        <p>前面六节给了你一堆散装的命令，这一节把它们组装成一个<strong>不需要临场发挥的流程</strong>。人在故障面前会慌，慌了就会乱敲命令；有一套固定顺序，你至少不会漏掉重要线索。核心原则是<strong>从便宜的信息开始，从外部开始，最后才进容器</strong>——越往后的手段越容易破坏现场。</p>
+
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>步骤</th><th>敲什么</th><th>你在找什么</th></tr></thead>
+            <tbody>
+              <tr><td>一、看状态</td><td>docker ps -a，加 inspect 的 Status 与 ExitCode</td><td>它是活着、死了还是反复重启？死于什么信号？RestartCount 是多少？</td></tr>
+              <tr><td>二、看日志</td><td>docker logs --tail 50 --timestamps，需要就加 -f</td><td>最后打出来的那句话是什么？有没有「端口被占」「连不上」「权限不够」这类明确信息？</td></tr>
+              <tr><td>三、看退出码</td><td>docker inspect 的 ExitCode 与 OOMKilled</td><td>是被信号杀的还是自己退的？内存超限了吗？</td></tr>
+              <tr><td>四、看配置</td><td>docker inspect 的 Cmd、Env、Mounts、Ports、HostConfig</td><td>它跑的到底是不是你以为的那个命令？环境变量对不对？挂载真的挂上了吗？</td></tr>
+              <tr><td>五、进容器</td><td>docker exec -it 名字 sh，只在前面四步都没给出答案时</td><td>文件在不在、配置改没改、能不能手动连上依赖、路径对不对</td></tr>
+              <tr><td>六、看资源</td><td>docker stats 加宿主机的整体资源</td><td>是它太能吃，还是邻居太能吃？有没有持续增长？</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>第一步到第四步全部是只读，不改变状态，信息量却最大。第五步开始「改变现场」：进容器之后你可能不小心改了文件、动了配置，留下自己造成的痕迹，让后面的人分不清哪个是原始故障。</p>
+
+        <pre data-lang="bash"><code>docker run -d --name dbcheck -e MYSQL_ROOT_PASSWORD=devpass -p 3307:3306 postgres:16-alpine
+docker logs --tail 20 dbcheck
+docker inspect --format "{{.State.ExitCode}} {{.State.OOMKilled}}" dbcheck
+docker inspect --format "{{json .Config.Env}}" dbcheck</code></pre>
+        <p class="cmd-note">这个例子埋了一个真实高频的错误：postgres 官方镜像不认 <code>MYSQL_ROOT_PASSWORD</code>，它要的是 <code>POSTGRES_PASSWORD</code>。第三条给出退出码 1，第四条打出的环境变量列表里只有那个拼错的名字。<strong>这就是第四步的价值：它不告诉你「为什么错」，但它把你以为的配置和真实的配置并排放出来，差异自己会说话。</strong>正确的动作是删掉再用 <code>-e POSTGRES_PASSWORD=devpass</code> 重建。</p>
+
+        <details>
+          <summary>展开：三个高频故障，用这套流程走一遍</summary>
+          <p><strong>故障一：容器起来就退出，退出码 0。</strong>第一步看到 <code>Exited (0)</code>，RestartCount 是 0；第二步日志里可能有一句「启动完成」或什么都没有；第三步 OOMKilled 是 false。这时不要怀疑 Docker，回去看第四步的 <code>Config.Cmd</code>——你十有八九跑了一个「执行完就结束」的命令。<strong>根本原因是：容器活着等于主进程活着，而你的主进程干完活就下班了。</strong>解法是给它一个不会退出的前台进程，比如 nginx 的 <code>-g "daemon off;"</code>。</p>
+          <p><strong>故障二：容器在跑，浏览器打不开。</strong>第一步状态是 Up，RestartCount 是 0。第二步日志显示服务正常监听。别急着 exec 进去，先走第四步，看 Ports 字段有没有映射、映射的宿主机端口是不是你以为的那个。新手最常见的两种情形：一是从头到尾没写 <code>-p</code>，服务在容器的 80 端口上好好待着，但宿主机上没有任何转发规则；二是写了 <code>-p 8080:80</code> 但服务实际监听 3000 端口。还有一种隐蔽的：服务监听在 <code>127.0.0.1</code> 而不是 <code>0.0.0.0</code>，外部连接根本进不来。<strong>完整解释属于第 07 章，但排查顺序是在这一章定的：状态、日志、配置，三道都是只读的。</strong></p>
+          <p><strong>故障三：容器反复重启。</strong>第一步就会发现异常：状态是 <code>Up 4 seconds</code>，RestartCount 却已经是 17——伪装成「正常运行」的故障。第三步看 ExitCode：每次都是 137 且 OOMKilled 为真，就是内存不够；退出码是 1 则是应用自己在报错，回到第二步读日志的前二十行。反复崩溃的应用，答案往往在启动阶段的日志里。</p>
+        </details>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>把这套顺序写在便利贴上贴在显示器边，直到你不再需要它。它的价值不在于命令本身，而在于它挡掉了一个很贵的坏习惯：<strong>凭猜测去敲命令。</strong>「我觉得可能是内存问题，先加个上限试试」——这种做法的危险不是浪费时间，而是它会改变系统状态，让原本清楚的故障变得不清楚。只读的诊断顺序重复多少次都不会污染现场。这条方法论在任何技术栈里都能用：把观察和干预分开，观察要穷尽，干预要一次一个变量。</p>
+        </div>
+
+        <div class="block method">
+          <span class="bt">方 法</span>
+          <p>另一个省力的习惯：<strong>每次排查结束后，把「现象到原因」那条链子用一句话写下来。</strong>比如「Up 几秒就重启，RestartCount 很高，ExitCode 137，OOMKilled 为真，原因是我给一个加载 400MB 词表的 Python 进程只留了 256MB」。半年后你再遇到类似现象，翻一下笔记，三十秒定位。排障能力不是看别人的文章长出来的，是把你自己的每一次失败归档长出来的。</p>
+        </div>
+
+        <div class="block back">
+          <span class="bt">回 望</span>
+          <p>第 02 章你学过 <code>docker context ls</code>，那是在确认「我的命令发给哪台机器」。把它接上一步：连不上 Docker 与「容器起不来」是两类完全不同的故障。前者是客户端与守护进程的连接问题，一条 <code>docker version</code> 就能看出客户端在说话而服务端没回应；后者是容器内部主进程的问题。排查顺序不能混，否则你会拿着容器的日志去找网络连接错误的答案。</p>
+        </div>
+
+        <div class="block ahead">
+          <span class="bt">前 瞻</span>
+          <p>这一章你敲的每一条命令，在第 08 章之后都会变成一个 YAML 字段。<code>-p</code> 会变成 <code>ports</code>，<code>-v</code> 会变成 <code>volumes</code>，<code>--restart</code> 会变成 <code>restart</code>，<code>--memory</code> 会变成资源限制的一段。所以现在多花点力气把每个参数「解决什么问题」想清楚是划算的——你不是在背命令，你是在提前学一份配置文件的词汇表。等到第 12 章见到 Kubernetes 的定义时，你会发现那里面描述的仍然是这几件事。</p>
+        </div>
+
+        <div class="block method">
+          <span class="bt">亲 手 做 一 遍</span>
+          <p>下面五个实验，一个都不要跳。它们的共同结构是：目的 → 命令 → 你会看到什么 → 你要解释为什么 → 追问一个变体。请把每一组的结果和你自己的解释都写进一个文本文件，这就是你的第一份排障笔记。</p>
+          <ol>
+            <li><strong>实验一：让退出码开口说话。</strong>命令：<code>docker run --name t1 alpine sh -c "exit 5"</code>，再 <code>docker run --name t2 alpine bash</code>，再 <code>docker run --rm alpine apk</code>；三条都用 <code>docker inspect --format '{{.State.ExitCode}}'</code> 取值。你会看到 5、127，以及 apk 的用法提示。请解释：为什么 <code>bash</code> 那条是 127 而不是 1？变体：跑 <code>docker run --rm alpine sh -c "exit 300"</code>，看它给出什么数字，再解释为什么它和 300 不一样。</li>
+            <li><strong>实验二：让内存限制发作。</strong>命令：<code>docker run --name oom1 --memory 64m python:3.12-alpine python -c "a = bytearray(200 * 1024 * 1024)"</code>。你会看到状态是 <code>Exited (137)</code>，而 inspect 给出 <code>137 true</code>。请解释：为什么日志里看不到任何错误信息？变体：把上限改成 512m 重跑，退出码变成 0。再想一步：如果不设 <code>--memory</code>，这个程序在你的笔记本上会有什么后果？</li>
+
+            <li><strong>实验三：看一个静默的空目录。</strong>命令：<code>docker run --rm -v .\docker-lab:/data alpine ls -la /data</code>，Docker 会替你建这个目录并挂上，里面是空的。变体：先在当前目录放一个文件，再把路径换成 <code>${PWD}</code>（在 PowerShell 里它展开成当前目录）重跑，你会看到那个文件出现在 <code>/data</code> 里。请说出两种写法在可移植性上的差别，以及为什么「挂载挂上了什么」比「命令有没有报错」更值得关心。</li>
+            <li><strong>实验四：让日志变成你的证据。</strong>命令：<code>docker run -d --name tick2 alpine sh -c "for i in 1 2 3 4 5; do echo 第 $i 次心跳; sleep 1; done"</code>；等它退出后跑 <code>docker logs --timestamps tick2</code> 和 <code>docker inspect --format '{{.State.ExitCode}}' tick2</code>。你会看到五行带时间戳的输出，退出码是 0。请解释：这个容器「失败」了吗？如果它是监控系统，你会对退出码 0 报警吗？变体：把循环改成永不结束的 <code>while true</code>，跑起来后 <code>docker stop tick2</code>，看退出码变成什么并解释。</li>
+            <li><strong>实验五：把账算清楚，然后只删该删的。</strong>命令：先 <code>docker system df -v</code> 找出占用最大的那一项，再 <code>docker ps -a</code> 看有多少已退出的容器；执行 <code>docker container prune</code> 并输入 <code>y</code>；最后 <code>docker system df</code> 再看一次。请解释：可回收的空间为什么会变化？变体：<strong>故意不要碰 <code>docker volume prune</code></strong>，先 <code>docker volume ls</code> 列出所有卷，逐个回想它是谁建的。这个变体不是清理，是让你在危险操作面前先练习「停下来看一眼」。</li>
+          </ol>
+        </div>
+
+        <div class="ornament">从 现 象 到 真 相</div>
+
+        <!-- ===================== 章末 ===================== -->
+        <h2 id="selfcheck">自测：检验你是否真的学懂了</h2>
+        <div class="block check">
+          <span class="bt">检 查 题</span>
+          <ol>
+            <li>用自己的话说出容器五种状态各自的物理含义。为什么 created 这个状态有存在的必要？
+              <details><summary>参考答案</summary><p>created 是容器对象已建好但主进程从未启动；running 是主进程在内核里跑；paused 是进程还在内存但被内核冻结、不再获得 CPU；exited 是主进程已结束、退出码已记录、可写层保留；dead 是删除失败留下的说不清的状态。created 的意义在于把「耗时的准备」和「快速的点火」分开。评分要点：说清「created 不是失败，只是一个提前做好的空壳」。</p></details>
+            </li>
+            <li>解释 docker run 与「docker create 加 docker start」的关系。为什么说 run 是一条「便利命令」？
+              <details><summary>参考答案</summary><p>run 等于创建加启动，再额外把本地终端可选地接上去，没有独立语义：创建期配置在内部的 create 阶段完成，运行期行为在 start 阶段完成。这个等价关系能推出一串结论：每次 run 都产生新容器；exited 容器堆积正是这么来的；创建期参数事后改不了。评分要点：提到「每次 run 都是一次新的 create」。</p></details>
+            </li>
+            <li>-i 和 -t 分别做什么？如果只给其中一个，会发生什么？
+              <details><summary>参考答案</summary><p>-i 保持标准输入打开，把终端按键送进容器；-t 分配伪终端，提供行编辑、回显、提示符。只给 -i 能执行但没有回显和提示符，界面像卡住；只给 -t 有提示符但输入送不进容器。评分要点：说出「回显与提示符来自伪终端」，并指出脚本不该加 -t。</p></details>
+            </li>
+            <li>docker exec 和 docker attach 最本质的区别是什么？为什么说 attach 一般不该用？
+              <details><summary>参考答案</summary><p>exec 是在容器里另起一个新进程并把终端接到它上面；attach 是把终端直接接到容器主进程的标准输入输出上。本质区别是「被连接的是哪个进程」。attach 的危险：Ctrl-C 会把信号直接送给主进程，整个容器跟着结束；多个 attach 共享同一个输出流。所以纪律是「要看输出就用 docker logs -f」。评分要点：必须提到「exec 退出不影响主进程」。</p></details>
+            </li>
+            <li>为什么 docker logs 看不到应用的日志？说出至少两种原因。
+              <details><summary>参考答案</summary><p>三种：应用把日志写进自己创建的文件（Docker 只截获标准输出与标准错误）；输出被缓冲在内存里还没刷出来；应用把自己守护进程化了，父进程退出后标准输出断开。评分要点：说出「Docker 不管理日志文件，只截获标准输出流」。</p></details>
+            </li>
+            <li>一个容器退出码是 137。你如何区分「被内存超限终结者杀」和「被 docker kill 杀」？
+              <details><summary>参考答案</summary><p>先看 inspect 里的 State.OOMKilled：为 true 就是内存超限被杀；为 false 就回看自己的操作历史。辅助线索：设了 --memory 而日志在最后一刻毫无征兆地断掉，强烈指向内存超限；stop 之后过了十秒才死，退出码也会是 137。评分要点：必须给出 OOMKilled 这个字段。</p></details>
+            </li>
+            <li>你 stop 了一个容器，退出码是 0 而不是 143。这说明什么？
+              <details><summary>参考答案</summary><p>说明主进程捕获并处理了 SIGTERM，做完清理后自己退出并返回 0。143 只在「进程没处理信号、直接被信号终结」时出现。这个差别是判断服务有没有优雅停机的好指标。评分要点：说出「143 不是 stop 的必然结果」。</p></details>
+            </li>
+
+            <li>docker ps 显示一个已经部署三天的服务状态是 Up 4 seconds。这可能是什么情况？你下一步做什么？
+              <details><summary>参考答案</summary><p>几乎肯定是在反复重启。下一步不是看日志第一行，而是先 inspect 看 RestartCount 与 ExitCode，再看 OOMKilled：RestartCount 很大说明它在崩溃循环；137 加 OOMKilled 为真是内存不足，1 是应用自身报错。评分要点：指出「Up 几秒」本身就是危险信号。</p></details>
+            </li>
+            <li>docker volume prune 删掉的是什么？为什么它比 docker container prune 危险得多？
+              <details><summary>参考答案</summary><p>删掉所有没被任何容器使用的数据卷，包括卷里的全部数据。更危险的原因是「未被使用」有两种含义——真的是垃圾，或者「你准备重建的数据库的数据」，而 Docker 无法区分；卷名又往往是随机 ID，确认步骤几乎无法人工核对。评分要点：提到「删卷等于格式化硬盘」。</p></details>
+            </li>
+            <li>三种资源限制（内存、CPU、进程数）分别超了会怎样？哪一种最该优先设置？
+              <details><summary>参考答案</summary><p>内存超限会被内核杀掉、退出码 137、OOMKilled 为 true，这是唯一会直接死掉的；CPU 超限只是被限速，表现为变慢；进程数超限会让新建进程失败，主进程却还活着。最该优先设的是内存，只有它失控时会拖垮整机。评分要点：说出「内存硬死、CPU 变慢、进程数部分坏掉」。</p></details>
+            </li>
+
+
+          </ol>
+        </div>
+
+        <h2 id="ask">自问自答：把知识压进长期记忆</h2>
+        <div class="block think">
+          <span class="bt">自 问 自 答</span>
+          <ol>
+            <li>合上页面，用自己的话讲：容器为什么会有 paused 这个状态？内核到底做了什么？<span class="sub">提示：从「CPU 时间片」这个词出发。</span></li>
+            <li>为什么 docker run 会不断产生新的容器，而大多数人很久以后才发现？<span class="sub">提示：想想 docker ps 默认只看 running，这个默认值让你看不见什么。</span></li>
+            <li>-it 里两个字母的分工，你能一边敲一边给别人解释吗？<span class="sub">提示：一个管输入通道，一个管终端感。</span></li>
+            <li>为什么 attach 按 Ctrl-C 会把容器杀掉，而 exec 里按 Ctrl-C 不会？<span class="sub">提示：信号送给了哪个进程。</span></li>
+            <li>如果一个应用只往标准输出打印，它还需要关心日志轮转吗？谁该关心？<span class="sub">提示：责任从应用转移到了运行环境。</span></li>
+            <li>128 加 N 这个约定解决的是什么问题？它为什么必须存在？<span class="sub">提示：父进程只能拿到一个整数，而它需要在这个整数里同时编码「正常退出」和「死于信号」。</span></li>
+            <li>为什么 --memory 是必须显式设置的，而 --cpus 相对没那么紧急？<span class="sub">提示：失控的后果不一样——一个是拖垮整机，一个是变慢。</span></li>
+            <li>unless-stopped 比 always 好在哪一句话上？这句话体现了什么工程价值观？<span class="sub">提示：人的显式意图应该被尊重。</span></li>
+            <li>把「删卷等于格式化硬盘」讲给室友听，你会用什么例子？<span class="sub">提示：重点是「你不知道自己在删什么」。</span></li>
+            <li>为什么排障顺序里「看配置」这一步最容易被跳过，却经常一步到位？<span class="sub">提示：因为它让你看到「你以为的」和「真实的」并排放在一起。</span></li>
+          </ol>
+        </div>
+
+        <h2 id="summary">本章总结</h2>
+        <ul>
+          <li>容器的生命周期就是其中 1 号进程的生命周期，五种状态是这件事的不同侧面。</li>
+          <li>created 不是失败，而是「配置已冻结、随时能点火」的空壳；它的存在让创建与启动可以分开。</li>
+          <li>docker run 等于创建加启动再加可选的终端接入；每次 run 都产生新容器，这就是 exited 容器堆积的原因。</li>
+          <li>-i 管输入通道，-t 管伪终端；只给一个都会得到一个很别扭的体验。</li>
+          <li>exec 在容器里另起进程，退出不影响主进程；attach 直接接到主进程的输入输出上，一次 Ctrl-C 就可能终结整个容器。</li>
+          <li>docker logs 能否看到日志，取决于应用是否只往标准输出打印——日志去哪是运行环境的责任。</li>
+          <li>退出码可以推理：0 是正常收工，1 是应用报错，143 是被 SIGTERM 终结，137 是被 SIGKILL 终结，而 137 至少有三种来源。</li>
+          <li>inspect 把「我记得应该是」换成「事实就是这样」，配合 --format 与 Go 模板能精确抠出任意字段。</li>
+          <li>stats 的价值是验证资源限制是否生效；内存超限硬死、CPU 超限变慢、进程数超限让部分功能静默失效。</li>
+          <li>unless-stopped 是绝大多数服务的正确答案，但它会掩盖故障：Up 几秒是个需要警惕的信号。</li>
+          <li>docker cp 是应急工具，高频使用说明挂载或构建设计有问题；docker system df 是所有清理动作的前提。</li>
+          <li>这一章最重要的一个判断：<strong>排障的顺序比排障的技巧更重要——先把只读的观察穷尽，再做一次只改一个变量的干预。</strong></li>
+        </ul>
+
+        <p>你在这一章里学到的东西，表面上是一堆命令，实际上是一种姿态：不再把容器当成一个开关，而是当成一个可以观察、可以推理、可以复现的系统。命令会忘，参数会记错，但「先看状态、再看日志、再看退出码、再 inspect、最后才进去」这套顺序不会忘——它不是知识点，它是你面对未知时的站姿。下一章我们回到源头：知道容器怎么活、怎么死之后，就该学怎么写出一份让容器活得正确的说明书。</p>
+
+        <h2 id="more">拓展：如果你想让这一章长得更深</h2>
+        <div class="block method">
+          <span class="bt">拓 展 阅 读</span>
+          <ul class="res-list">
+            <li>
+              <span class="rt">Docker 命令行参考<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/reference/cli/docker/" target="_blank" rel="noopener">https://docs.docker.com/reference/cli/docker/</a>
+              <span class="rd">本章所有命令的权威出处。不要通读，带着具体问题查：stop 的超时默认值、ps 的 --filter 支持哪些键。重点看每页的「参数列表」与「退出状态」。</span>
+            </li>
+            <li>
+              <span class="rt">容器资源约束<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/engine/containers/resource_constraints/" target="_blank" rel="noopener">https://docs.docker.com/engine/containers/resource_constraints/</a>
+              <span class="rd">本章只讲了三条限制，这一页把内存的软限制与硬限制、CPU 份额与周期讲全。带着一个问题读：为什么设了 CPU 限制，容器跑起来还是把机器拖慢了一点。</span>
+            </li>
+            <li>
+              <span class="rt">清理磁盘空间<span class="tag">官方文档</span></span>
+              <a class="ru plain" href="https://docs.docker.com/config/pruning/" target="_blank" rel="noopener">https://docs.docker.com/config/pruning/</a>
+              <span class="rd">动手删任何东西之前先读这一页：prune 的默认行为、哪些对象算「未使用」都写得很清楚。带着一个问题读：<code>docker system prune -a --volumes</code> 到底会删哪些东西。</span>
+            </li>
+            <li>
+              <span class="rt">Linux cgroups 手册页<span class="tag">手册页</span></span>
+              <a class="ru plain" href="https://man7.org/linux/man-pages/man7/cgroups.7.html" target="_blank" rel="noopener">https://man7.org/linux/man-pages/man7/cgroups.7.html</a>
+              <span class="rd">退出码 137 与 143 的根源在这里：cgroups 是内核实施内存与 CPU 限制的机制，超限行为、冻结与解冻都有说明。偏硬，不用全读，搜 memory 与 freezer 两个关键词。</span>
+            </li>
+            <li>
+              <span class="rt">命令行艺术（中文）<span class="tag">开源中文</span></span>
+              <a class="ru plain" href="https://github.com/jlevy/the-art-of-command-line/blob/master/README-zh.md" target="_blank" rel="noopener">https://github.com/jlevy/the-art-of-command-line/blob/master/README-zh.md</a>
+              <span class="rd">本章有大量「把信息拼成一张表」的操作，这份清单能补上这类基本功。重点读「文件及数据处理」「进程管理」两节。</span>
+            </li>
+            <li>
+              <span class="rt">十二要素应用（中文）<span class="tag">方法论</span></span>
+              <a class="ru plain" href="https://12factor.net/zh_cn/" target="_blank" rel="noopener">https://12factor.net/zh_cn/</a>
+              <span class="rd">本章讲的「应用只管往标准输出打印」在这里是独立的一条：「日志」；「快速启动与优雅终止」直接对应 SIGTERM 与退出码。带着一个问题读：我的项目里哪几条被违反了。</span>
+            </li>
+          </ul>
+        </div>
+        <div class="block method">
+          <span class="bt">值 得 品 读 的 书</span>
+          <ul class="booklist">
+            <li>
+              <span class="bn">《深入浅出 Docker》</span> <span class="ba">Nigel Poulton 著</span>
+              <span class="bw">这本书补的是「整体图像」。它薄、图多，特别适合刚学完命令之后做一次系统性回看。带着一个问题读：我这一章学的东西，在它画的图里落在哪个位置。</span>
+            </li>
+            <li>
+              <span class="bn">《Docker 实践》</span> <span class="ba">Ian Miell、Aidan Hobson Sayers 著</span>
+              <span class="bw">这本书补的是「坑」。写法是「问题—方案—讨论」，关于容器调试、日志、进容器排障的部分与本章高度重合。建议敲完本章所有命令之后再读。带着一个问题读：它提到的坑，我能不能在自己机器上复现一个。</span>
+            </li>
+            <li>
+              <span class="bn">《The Linux Command Line》</span> <span class="ba">William Shotts 著</span>
+              <span class="bw">这本书补的是「地基」。本章的每条命令最终都要落到 Linux 的进程、信号、标准输入输出、管道上，而这本书训练这些概念最扎实。不必通读，先读「进程」与「作业控制」两部分。</span>
+            </li>
+          </ul>
+        </div>
+
+        <nav class="chnav" id="chnav"></nav>
+
+      </article>
+
+      <footer class="footer">
+        <p><b>深海与木箱 · Docker 深度学习手册</b>　第 04 章</p>
+        <p><a href="../index.html">← 返回总览与地图</a>　·　<a href="../glossary.html">术语总表</a></p>
+      </footer>
+    </div>
+  </main>
+</div>
+
+<script src="../data/terms.data.js"></script>
+<script src="../data/chapters.data.js"></script>
+<script src="../assets/app.js"></script>
+</body>
+</html>

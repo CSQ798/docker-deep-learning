@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>页面不存在 · 深海与木箱</title>
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="">
+
+<header class="topbar" id="topbar"></header>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="main">
+    <div class="wrap">
+      <article class="article" id="article">
+
+        <div class="ch-eyebrow"><span class="num">404</span><span>没 有 这 一 页 · NOT FOUND</span></div>
+        <h1>这一页不在手册里</h1>
+        <p class="ch-tagline">你在深海里敲了一扇不存在的门。门后没有责怪，只有一条回去的路。</p>
+
+        <p>
+          会出现这个页面，通常只有三种原因：链接里少打了一个字；
+          你正在读的那台服务器上还没有这一页（如果你是在 GitHub Pages 上看到的，
+          可能是刚推送完还在等它构建）；或者这一页曾经存在，后来被我改名了。
+        </p>
+
+        <div class="block method">
+          <span class="bt">回 到 岸 上</span>
+          <ul>
+            <li><a href="index.html">总览与学习地图</a>——十三章的入口，建议从第 00 章开始读。</li>
+            <li><a href="glossary.html">术语总表</a>——一百二十一条术语，含英文全称、缩写、中文释义与详细解释。</li>
+            <li><a href="chapters/ch00-地图.html">第 00 章 · 导学</a>——如果这是你第一次来，从这里进最合适。</li>
+            <li><a href="chapters/ch12-进阶.html">第 12 章 · 走向远方</a>——如果你已经读完了前面十一章。</li>
+          </ul>
+        </div>
+
+        <div class="block alert">
+          <span class="bt">如 果 你 是 从 别 处 点 进 来 的</span>
+          <p>
+            说明那个链接写错了。把地址栏里 <code>github.io/</code> 之后的部分删掉，
+            只留下仓库根路径，就能回到首页。
+          </p>
+        </div>
+
+        <blockquote>
+          <p>走错路本身不是问题，问题是站在门口不动。</p>
+        </blockquote>
+
+      </article>
+
+      <footer class="footer">
+        <p><b>深海与木箱 · Docker 深度学习手册</b></p>
+        <p><a href="index.html">← 返回总览与地图</a>　·　<a href="glossary.html">术语总表</a></p>
+      </footer>
+    </div>
+  </main>
+</div>
+
+<script src="data/terms.data.js"></script>
+<script src="data/chapters.data.js"></script>
+<script src="assets/app.js"></script>
+<script>
+/* 侧边栏在高亮"本页"时需要一个存在的 id；404 页不在章节表里，这里把高亮清掉 */
+(function () {
+  document.querySelectorAll('.toc a.active').forEach(function (a) { a.classList.remove('active'); });
+})();
+</script>
+</body>
+</html>

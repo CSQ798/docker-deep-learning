@@ -1,0 +1,19 @@
+# 临时文件与系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+*.bak
+
+# 编辑器的本地设置
+.vscode/
+.idea/
+
+# 自检脚本产生的临时产物
+.recovered-*
+.rebuilt-*
+_count_*.js
+.write-test
+
+# Node（本项目不需要依赖，仅防误提交）
+node_modules/

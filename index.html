@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>深海与木箱 · Docker 深度学习手册</title>
+<meta name="description" content="为零基础学习者写的 Docker 深度学习手册：从容器思想到镜像、网络、安全、工程化与 AI 场景，十二章连续阅读路径。">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="home">
+
+<header class="topbar" id="topbar"></header>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="main">
+    <div class="wrap wide">
+
+      <section class="hero">
+        <div class="ch-eyebrow"><span class="num">DOCKER</span><span>深度学习手册 · 第一版 · 写给大一新生的你</span></div>
+        <h1>深海与木箱</h1>
+        <p class="motto">容器不过是一只用代码折出的木箱，而你要学会的，是在深海中造箱、装货、远航。</p>
+        <p class="lead">
+          你在电脑上装好的那个 Docker，是当代软件工业里一件安静而伟大的工具。它没有炫目的界面，
+          却支撑着几乎整个云计算世界。这份手册不打算让你"三天速通"，它想做一件更慢、也更有价值的事：
+          带你把 Docker 背后的每一个概念，从"会用"理解到"为什么这样设计"，并且在这个过程中，
+          顺便学会<strong>如何去学习一门技术</strong>。
+        </p>
+        <div class="metrics" id="stats"></div>
+      </section>
+
+      <section id="howto">
+        <div class="section-h">
+          <h2>这份手册怎么用</h2>
+          <span class="hint">读之前请先花五分钟读这一节</span>
+        </div>
+
+        <div class="block method">
+          <span class="bt">使 用 方 法</span>
+          <ol>
+            <li><strong>按顺序读，不要跳。</strong>这十二章不是并列的知识点，而是一条因果链：第 1 章讲"为什么需要它"，第 2 章讲"它是什么"，第 3—5 章讲"怎么造"，第 6—8 章讲"怎么让它活着并与世界连通"，第 9—10 章讲"怎么让它安全地进入真实工程"，第 11—12 章讲"它在 AI 与集群中的远方"。跳读会让你只记住命令，不得到理解。</li>
+            <li><strong>每一章都要动手。</strong>每章的操作步骤都设计成可以在你的 Docker Desktop 上直接执行。只读不敲，等于学游泳时只看视频。</li>
+            <li><strong>点击带点状下划线的词。</strong>正文里凡是<span class="term-example">这样带点状下划线</span>的词，都可以点击，会弹出它的英文全称、英文缩写、中文释义和详细解释。<strong>如果你在页面上看不到下划线</strong>（浏览器未启用脚本时），请直接去 <a href="glossary.html">术语总表</a> 查找。</li>
+            <li><strong>不要立刻看答案。</strong>每章末尾的自测题，答案折叠在题目下方。请先合上页面，用自己的话把它讲一遍，再展开对照。<em>能讲出来，才算学会。</em></li>
+            <li><strong>认真对待"思考"框里的问题。</strong>那些问题没有标准答案，它们唯一的目的，是让你的大脑从"接收模式"切到"创造模式"。有些问题可能在你学完第 12 章之后才真正想明白——这很正常，把它们放在心里发酵。</li>
+            <li><strong>遇到卡壳，先记录，再继续。</strong>准备一个笔记本（纸的最好），专门用来写"我还不太懂的问题"。允许自己暂时带着疑问往前走，因为很多答案会在后面的章节里自然解开。</li>
+          </ol>
+        </div>
+
+        <div class="block alert">
+          <span class="bt">一 个 提 醒</span>
+          <p>这份手册的默认预期是：<strong>你愿意投入一到两个月，甚至更久。</strong>它刻意没有写"每天该学多少"，
+          因为学习的节奏应该由你的好奇心决定，而不是由进度表决定。你会在某些章节停很久，在另一些章节读得飞快，
+          这都是对的。真正重要的不是你用了几周，而是当你合上电脑时，脑子里是否长出了一张能自己延伸的网。</p>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-h">
+          <h2>十二章学习地图</h2>
+          <span class="hint">点击任意一块进入</span>
+        </div>
+        <nav class="map" id="map"></nav>
+      </section>
+
+      <section>
+        <div class="section-h">
+          <h2>术语总表</h2>
+          <span class="hint">先扫一眼，混个脸熟，不必记住</span>
+        </div>
+        <p>下面这些词会在手册里反复出现。现在不认识完全没关系——事实上，你现在不认识它们才是正常的。
+        它们全部都在 <a href="glossary.html">术语总表</a> 里有详细解释，你可以随时查阅，也可以点开看看它们的全称，
+        感受一下这些缩写背后其实都是朴素的意思。</p>
+        <div class="block" id="term-cloud-wrap">
+          <span class="bt">词 汇 池</span>
+          <p id="term-cloud" style="line-height:2.6"></p>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-h">
+          <h2>写在开始之前</h2>
+          <span class="hint">关于你即将成为的那个人</span>
+        </div>
+        <p>
+          学会 Docker，你不会因此立刻成为高手。但你会在某一天忽然发现：当你换一台电脑、换一个系统、
+          或者把你的项目交给同学时，那种"我这里明明能跑"的焦虑消失了。你会开始用另一种眼光看软件：
+          它不再是"我电脑上的一堆文件"，而是一个<strong>可以被完整描述、被完整运输、被完整复现的东西</strong>。
+        </p>
+        <p>
+          这种眼光，是工程师和"会写代码的人"之间真正的分界线。你在大一就撞上它，是件幸运的事。
+          请慢一点，深一点，享受它。
+        </p>
+        <div class="ornament">慢 下 来</div>
+      </section>
+
+      <footer class="footer">
+        <p><b>深海与木箱 · Docker 深度学习手册</b>　版本 v1.0　为一位大一新生而写。</p>
+        <p>全部章节可离线阅读。正文中的术语解释来自本手册自建的术语库，可点击正文中的术语或进入<a href="glossary.html">术语总表</a>查阅。</p>
+        <p>建议学习顺序：<a href="chapters/ch00-地图.html">第 00 章 导学</a> → 依次阅读 → <a href="chapters/ch12-进阶.html">第 12 章 走向远方</a>。</p>
+      </footer>
+
+    </div>
+  </main>
+</div>
+
+<script src="data/terms.data.js"></script>
+<script src="data/chapters.data.js"></script>
+<script src="assets/app.js"></script>
+<script>
+/* 首页顶部那段"这样带点状下划线"的示例，做成可点击的真实术语 */
+(function () {
+  var el = document.querySelector('.term-example');
+  if (!el || !window.DL_TERMS) return;
+  var t = window.DL_TERMS.filter(function (x) { return x.term === '容器'; })[0];
+  if (!t) return;
+  var s = document.createElement('span');
+  s.className = 'term no-linkify';
+  s.setAttribute('role', 'button');
+  s.setAttribute('tabindex', '0');
+  s.setAttribute('data-term', String(t._i));
+  s.title = '试一试：点击看看会发生什么';
+  s.textContent = '这样带点状下划线';
+  el.parentNode.replaceChild(s, el);
+})();
+</script>
+</body>
+</html>
